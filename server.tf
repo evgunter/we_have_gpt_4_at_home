@@ -39,7 +39,7 @@ resource "google_compute_instance" "default" {
       pip3 install python-dotenv python-telegram-bot openai
 
       # Set up the cron job to execute the Python script every 4 hours
-      (crontab -l 2>/dev/null; echo "0 */4 * * * cd ${local.script_directory} && python3 ${local.script_name}") | crontab -
+      (crontab -l 2>/dev/null; echo "0 */4 * * * cd ${local.script_directory} && pkill -f ${local.script_name} && python3 ${local.script_name}") | crontab -
   EOF
 
     provisioner "file" {
