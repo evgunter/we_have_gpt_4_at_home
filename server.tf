@@ -58,6 +58,9 @@ resource "google_compute_instance" "default" {
 
       # Set up the cron job to execute the Python script every 4 hours
       (crontab -l 2>/dev/null; echo "0 */4 * * * cd ${local.script_directory} && pkill -f ${local.script_name} && python3 ${local.script_name}") | crontab -
+
+      # Start the Python script for the first time
+      python3 ${local.script_name}
   EOF
 
     provisioner "file" {
