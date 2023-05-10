@@ -1,6 +1,7 @@
 import os
 import dotenv
 import logging
+from telegram.constants import ParseMode
 import telegram.ext
 import time
 import openai
@@ -12,7 +13,7 @@ MODEL = "gpt-4"  # "gpt-3.5-turbo"  # "text-davinci-003"
 LONG_MODEL = "gpt-4-32k"
 FAST_MODEL = "gpt-3.5-turbo"
 
-SYSTEM_PROMPT = {"role": "system", "content": "You are a helpful Telegram chatbot. You can use Telegram message formatting, like `code`, ```code block```, ||spoiler||, **bold**, and __italics__."}
+SYSTEM_PROMPT = {"role": "system", "content": "You are a helpful Telegram chatbot. You can use Telegram message formatting, like `code`, ```code block```, ||spoiler||, *bold*, and _italics_."}
 
 TURBO_COMMAND = 'turbo'
 
@@ -35,7 +36,8 @@ conversations = {}  # current conversations for each chat
 async def start(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE):
     logging.debug("adding new chat")
     await context.bot.send_message(chat_id=update.effective_chat.id,
-                                      text="welcome!",
+                                   text="welcome!",
+                                   parse_mode=ParseMode.MARKDOWN,
      )  # reply_to_message_id=update.message.message_id)
 
 def reset_conversation(chat_id):
@@ -46,6 +48,7 @@ async def new_conversation(update: telegram.Update, context: telegram.ext.Contex
     logging.debug("new conversation started")
     await context.bot.send_message(chat_id=update.effective_chat.id,
                                    text="new conversation started",
+                                   parse_mode=ParseMode.MARKDOWN,
     )  # reply_to_message_id=update.message.message_id)
 
 async def regular_message(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE, process_msg=lambda msg: msg, model=MODEL):
@@ -58,6 +61,7 @@ async def regular_message(update: telegram.Update, context: telegram.ext.Context
         logging.info("chat missing!")
         await context.bot.send_message(chat_id=current_chat_id,
                                        text="looks like i've lost the previous conversation! i've started a new one. send your message again, including any context from the previous conversation.",
+                                       parse_mode=ParseMode.MARKDOWN,
         )  # reply_to_message_id=update.message.message_id)
         return
     
@@ -71,13 +75,15 @@ async def regular_message(update: telegram.Update, context: telegram.ext.Context
         #   if that turns out to be a problem
         logging.error(e)
         await context.bot.send_message(chat_id=current_chat_id,
-                                        text=f"model failed with error: {e}",
+                                       text=f"model failed with error: {e}",
+                                       parse_mode=ParseMode.MARKDOWN,
         )  # reply_to_message_id=update.message.message_id)
         return
     conversations[current_chat_id].append({"role": "assistant", "content": response})
 
     await context.bot.send_message(chat_id=current_chat_id,
                                    text=response,
+                                   parse_mode=ParseMode.MARKDOWN,
     )  # reply_to_message_id=update.message.message_id)
 
 async def turbo_message(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE):

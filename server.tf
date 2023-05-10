@@ -1,3 +1,13 @@
+terraform {
+  required_providers {
+    google = {
+      source = "hashicorp/google"
+      version = ">= 4.0.0"
+    }
+  }
+}
+
+
 provider "google" {
     project     = "bot-server-383318"
     region      = "us-west1"
@@ -5,7 +15,7 @@ provider "google" {
 }
 
 locals {
-    script_directory = "/home"
+    script_directory = "/home/evan"
     script_name = "bot_script.py"
 }
 
@@ -25,10 +35,10 @@ resource "google_compute_instance" "default" {
       # Install required packages for Python script
       sudo apt update
       sudo apt -y install python3 python3-pip
+      pip3 install dotenv
 
       # Set up the cron job to execute the Python script every 4 hours
       (crontab -l 2>/dev/null; echo "0 */4 * * * cd ${local.script_directory} && python3 ${local.script_name}") | crontab -
-      chmod 600 /var/spool/cron/crontabs/$USER
   EOF
 
     provisioner "file" {
@@ -36,7 +46,7 @@ resource "google_compute_instance" "default" {
         destination = "${local.script_directory}/${local.script_name}"
         connection {
             type = "ssh"
-            user = "google_compute_engine"
+            user = "evan"
             private_key = file("~/.ssh/google_compute_engine")
             host = self.network_interface[0].access_config[0].nat_ip
         }
@@ -49,7 +59,6 @@ resource "google_compute_instance" "default" {
     }
     network_interface {
         network = "default"
-
         access_config {}
     }
 }
