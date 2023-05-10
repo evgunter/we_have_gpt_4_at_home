@@ -13,7 +13,7 @@ MODEL = "gpt-4"  # "gpt-3.5-turbo"  # "text-davinci-003"
 LONG_MODEL = "gpt-4-32k"
 FAST_MODEL = "gpt-3.5-turbo"
 
-SYSTEM_PROMPT = {"role": "system", "content": "You are a helpful Telegram chatbot. You can use Telegram message formatting, like `code`, ```code block```, ||spoiler||, *bold*, and _italics_."}
+SYSTEM_PROMPT = {"role": "system", "content": "You are a helpful Telegram chatbot. You can use Telegram markdown message formatting, e.g. `inline code`, ```c++\ncode written in c++```, *bold*, and _italic_."}
 
 TURBO_COMMAND = 'turbo'
 
@@ -26,7 +26,11 @@ class Message:
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(f'gpt_4_telegram_{time.time()}.log'),
+    ]
 )
 
 conversations = {}  # current conversations for each chat
@@ -76,7 +80,7 @@ async def regular_message(update: telegram.Update, context: telegram.ext.Context
         logging.error(e)
         await context.bot.send_message(chat_id=current_chat_id,
                                        text=f"model failed with error: {e}",
-                                       parse_mode=ParseMode.MARKDOWN,
+                                       # parse mode is plain text because a common error is that the model returns an invalid message
         )  # reply_to_message_id=update.message.message_id)
         return
     conversations[current_chat_id].append({"role": "assistant", "content": response})

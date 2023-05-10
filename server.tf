@@ -15,7 +15,8 @@ provider "google" {
 }
 
 locals {
-    script_directory = "/home/evan"
+    user_name = "evan"
+    script_directory = "/home/${local.user_name}"
     script_name = "bot_script.py"
 }
 
@@ -35,7 +36,7 @@ resource "google_compute_instance" "default" {
       # Install required packages for Python script
       sudo apt update
       sudo apt -y install python3 python3-pip
-      pip3 install dotenv
+      pip3 install python-dotenv python-telegram-bot openai
 
       # Set up the cron job to execute the Python script every 4 hours
       (crontab -l 2>/dev/null; echo "0 */4 * * * cd ${local.script_directory} && python3 ${local.script_name}") | crontab -
@@ -46,7 +47,17 @@ resource "google_compute_instance" "default" {
         destination = "${local.script_directory}/${local.script_name}"
         connection {
             type = "ssh"
-            user = "evan"
+            user = local.user_name
+            private_key = file("~/.ssh/google_compute_engine")
+            host = self.network_interface[0].access_config[0].nat_ip
+        }
+    }
+    provisioner "file" {
+        source = ".env"
+        destination = "${local.script_directory}/.env"
+        connection {
+            type = "ssh"
+            user = local.user_name
             private_key = file("~/.ssh/google_compute_engine")
             host = self.network_interface[0].access_config[0].nat_ip
         }
