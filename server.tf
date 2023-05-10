@@ -7,16 +7,34 @@ terraform {
   }
 }
 
+variable "project" {
+  description = "The project ID"
+  type = string
+}
+
+variable "region" {
+  description = "The region to deploy to"
+  type = string
+}
+
+variable "zone" {
+  description = "The zone to deploy to"
+  type = string
+}
+
+variable "user_name" {
+    description = "The username to SSH in with"
+    type = string
+}
 
 provider "google" {
-    project     = "bot-server-383318"
-    region      = "us-west1"
-    zone        = "us-west1-a"
+    project     = var.project
+    region      = var.region
+    zone        = var.zone
 }
 
 locals {
-    user_name = "evan"
-    script_directory = "/home/${local.user_name}"
+    script_directory = "/home/${var.user_name}"
     script_name = "bot_script.py"
 }
 
@@ -47,7 +65,7 @@ resource "google_compute_instance" "default" {
         destination = "${local.script_directory}/${local.script_name}"
         connection {
             type = "ssh"
-            user = local.user_name
+            user = var.user_name
             private_key = file("~/.ssh/google_compute_engine")
             host = self.network_interface[0].access_config[0].nat_ip
         }
@@ -57,7 +75,7 @@ resource "google_compute_instance" "default" {
         destination = "${local.script_directory}/.env"
         connection {
             type = "ssh"
-            user = local.user_name
+            user = var.user_name
             private_key = file("~/.ssh/google_compute_engine")
             host = self.network_interface[0].access_config[0].nat_ip
         }
