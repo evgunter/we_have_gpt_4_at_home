@@ -35,7 +35,8 @@ provider "google" {
 
 locals {
     script_directory = "/home/${var.user_name}"
-    script_name = "bot_script.py"
+    bot_script_name = "bot_script.py"
+    restart_script_name = "restart_bot.sh"
 }
 
 # SSH in with `gcloud compute ssh bot-server --zone us-west1-a`
@@ -56,16 +57,18 @@ resource "google_compute_instance" "default" {
       sudo apt -y install python3 python3-pip
       pip3 install python-dotenv python-telegram-bot openai
 
+      chmod +x ${local.restart_script_name}
+
       # Set up the cron job to execute the Python script every 4 hours
-      (crontab -l 2>/dev/null; echo "0 */4 * * * cd ${local.script_directory} && pkill -f ${local.script_name} && python3 ${local.script_name}") | crontab -
+      (crontab -l 2>/dev/null; echo "0 */4 * * * cd ${local.script_directory} && ./${local.restart_script_name}") | crontab -
 
       # Start the Python script for the first time
-      python3 ${local.script_name}
+      python3 ${local.bot_script_name}
   EOF
 
     provisioner "file" {
-        source = "gpt_4_telegram.py"
-        destination = "${local.script_directory}/${local.script_name}"
+        source = local.bot_script_name
+        destination = "${local.script_directory}/${local.bot_script_name}"
         connection {
             type = "ssh"
             user = var.user_name
@@ -76,6 +79,16 @@ resource "google_compute_instance" "default" {
     provisioner "file" {
         source = ".env"
         destination = "${local.script_directory}/.env"
+        connection {
+            type = "ssh"
+            user = var.user_name
+            private_key = file("~/.ssh/google_compute_engine")
+            host = self.network_interface[0].access_config[0].nat_ip
+        }
+    }
+    provisioner "file" {
+        source = local.restart_script_name
+        destination = "${local.script_directory}/${local.restart_script_name}"
         connection {
             type = "ssh"
             user = var.user_name
