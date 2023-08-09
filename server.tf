@@ -59,8 +59,8 @@ resource "google_compute_instance" "default" {
 
       chmod +x ${local.restart_script_name}
 
-      # Set up the cron job to execute the Python script every 4 hours
-      (crontab -l 2>/dev/null; echo "0 */4 * * * cd ${local.script_directory} && ./${local.restart_script_name}") | crontab -
+      # Set up the cron job to restart the script at 4am every day
+      (crontab -l 2>/dev/null; echo "0 4 * * * cd ${local.script_directory} && ./${local.restart_script_name}") | crontab -
 
       # Start the Python script for the first time
       python3 ${local.bot_script_name}
