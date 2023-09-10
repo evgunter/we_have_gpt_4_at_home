@@ -39,11 +39,11 @@ locals {
     restart_script_name = "restart_bot.sh"
 }
 
-# SSH in with `gcloud compute ssh bot-server --zone us-west1-a`
+# SSH in with e.g. (using appropriate zone) `gcloud compute ssh bot-server --zone us-west1-a`
 resource "google_compute_instance" "default" {
     name = "bot-server"
     machine_type = "f1-micro"
-    zone = "us-west1-a"
+    zone = var.zone
 
     # Debug with `google_metadata_script_runner startup`
     metadata_startup_script = <<-EOF

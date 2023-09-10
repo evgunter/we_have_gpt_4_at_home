@@ -16,4 +16,9 @@ build/
 .DS_STORE
 
 .env
-.tfvars
+*.tfvars
+*.tfstate
+*.tfstate.backup
+*.terraform*
+
+*.zip
