@@ -152,7 +152,7 @@ resource "google_cloudfunctions_function" "function" {
   name                  = "gptathome"
   description           = "runs gpt-4 telegram bot"
   runtime               = "python39"
-  available_memory_mb   = 128
+  available_memory_mb   = 1024
   source_archive_bucket = google_storage_bucket.bucket.name
   source_archive_object = google_storage_bucket_object.archive.name
   trigger_http          = true
@@ -168,16 +168,11 @@ resource "google_cloudfunctions_function" "function" {
   }
 }
 
-# resource "google_service_account" "service_account" {
-#   account_id   = "gptathome"
-#   display_name = "gptathome"
-# }
-
 resource "google_cloudfunctions_function_iam_member" "invoker" {
   project        = google_cloudfunctions_function.function.project
   region         = google_cloudfunctions_function.function.region
   cloud_function = google_cloudfunctions_function.function.name
 
   role   = "roles/cloudfunctions.invoker"
-  member = "allUsers" # "serviceAccount:${google_service_account.service_account.email}"
+  member = "allUsers"
 }

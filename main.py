@@ -1,16 +1,17 @@
 import logging
 import openai
 
+from asyncio import run as asyncio_run
 from datetime import datetime
 from google.cloud import storage
 from json import dumps, loads
 from os import getenv, path, remove
 from random import choices as rand_choices
 from string import ascii_letters, digits
-from telegram import Bot, Message, Update
+from telegram import Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from telegram.ext import ApplicationBuilder, CallbackContext, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CallbackContext, ContextTypes, CommandHandler, ExtBot, MessageHandler, filters
 from tiktoken import encoding_for_model
 from time import time
 from typing import Optional
@@ -87,7 +88,7 @@ class RemoteData:
         source_blob_name = f"{chat_id}/{self.get_live_conversation(chat_id)}"
         blob = self.bucket.blob(source_blob_name)
         logging.info('File {} downloaded'.format(source_blob_name))
-        return loads(blob.download_as_string())
+        return loads(blob.download_as_bytes())
     
     def append_conversation(self, chat_id, role, content):
         conversation_data = self.read_conversation(chat_id)
@@ -135,7 +136,7 @@ class RemoteData:
         source_blob_name = f"{chat_id}/live"
         blob = self.bucket.blob(source_blob_name)
         if blob.exists():
-            live_conversation_id_bin = blob.download_as_string()
+            live_conversation_id_bin = blob.download_as_bytes()
             # convert from bytes to string
             live_conversation_id = live_conversation_id_bin.decode("utf-8")
             logging.info(f"live conversation for chat {chat_id} is {live_conversation_id}")
@@ -147,19 +148,49 @@ class RemoteData:
 
 # === Telegram stuff ===================================================================================================
 
+# for some reason a real CallbackContext is not working with the webhook setup
+class FakeContext(CallbackContext):
+    def __init__(self, bot, message, err):
+        self._bot = bot
+        self._error = err
+
+        # if message starts with '/', it's a command
+        if message.text.startswith("/"):
+            self._args = message.text.split(" ", 1)[1:]
+        else:
+            self._args = []
+    
+    @property
+    def bot(self):
+        return self._bot
+    
+    @property
+    def args(self):
+        return self._args
+    
+    @property
+    def error(self):
+        return self._error
+    
+    def set_error(self, err):
+        self._error = err
+
 async def message_user(chat_id: int, msg: str, context: ContextTypes.DEFAULT_TYPE, parse_mode=ParseMode.MARKDOWN):
     logging.debug(f"sending message to chat {chat_id}: {msg}")
+
     try:
         if parse_mode is not None:
             await context.bot.send_message(chat_id=chat_id,
                                            text=msg,
                                            parse_mode=parse_mode)
+            logging.debug(f"sent message to chat {chat_id}: {msg}")
             return
     except BadRequest as e:
         logging.error(f"bad request: {e}. trying again with parse_mode=None")
 
     await context.bot.send_message(chat_id=chat_id,
                                    text=msg)
+    logging.debug(f"sent plaintext message to chat {chat_id}: {msg}")
 
 async def admin_message(msg: str, context: ContextTypes.DEFAULT_TYPE):
     logging.debug(f"sending admin message: {msg}")
@@ -258,6 +289,7 @@ async def respond_conversation(remote_data: RemoteData, current_chat_id: int, co
             return
     
     # query the model
+    logging.info(f"querying model {model}...")
     try:
         response = query_model(chat_history, model=model)
     except Exception as e:
@@ -306,14 +338,14 @@ def no_response(remote_data: RemoteData):
         await record_user_message(remote_data, update, process_msg=removenoresponsecommand)
     return no_response_
 
-async def record_document(remote_data: RemoteData, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    content = await read_document(update.message, context)
+async def record_document(remote_data: RemoteData, update: Update):
+    content = await read_document(update.message)
     await record_user_message(remote_data, update, process_msg=lambda msg: format_document(msg.document.file_name, content, msg.caption))
 
 def handle_document(remote_data: RemoteData):
     async def handle_document_(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info(f"document received at {time()}: {update}")
-        await record_document(remote_data, update, context)
+        await record_document(remote_data, update)
         
         current_chat_id = update.effective_chat.id
 
@@ -331,7 +363,7 @@ def handle_document(remote_data: RemoteData):
             await message_user(current_chat_id, "document received", context)
     return handle_document_
 
-async def read_document(msg: Message, context: ContextTypes.DEFAULT_TYPE):
+async def read_document(msg: Message):
     # check that the effective attachment is a file rather than a photo, poll, etc
     
     logging.debug(f"msg.effective_attachment: {msg.effective_attachment}")
@@ -403,7 +435,17 @@ def query_model(previous_messages, model=MODEL):
 
 # === Main =============================================================================================================
 
-def setup_app():
+def command_handlers(remote_data: RemoteData) -> dict[str, CommandHandler]:
+    return {
+    "start": start,
+    "help": help,
+    "new_conversation": new_conversation(remote_data),
+    TURBO_COMMAND: turbo_message(remote_data),
+    NO_RESPONSE_COMMAND: no_response(remote_data),
+    "verify": verify(remote_data),
+}
+
+def setup_app_polling():
     openai.api_key = getenv("OPENAI_API_KEY")
     BOT_TOKEN = getenv("BOT_TOKEN")
     bucket = getenv("BUCKET")
@@ -412,24 +454,17 @@ def setup_app():
     
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    start_handler = CommandHandler('start', start)
-    help_handler = CommandHandler('help', help)
-    new_conversation_handler = CommandHandler('new_conversation', new_conversation(remote_data))
-    turbo_handler = CommandHandler(TURBO_COMMAND, turbo_message(remote_data))
-    no_response_handler = CommandHandler(NO_RESPONSE_COMMAND, no_response(remote_data))
-    verify_handler = CommandHandler('verify', verify(remote_data))
+    # add command handlers
+    for command, handler_fn in command_handlers(remote_data).items():
+        application.add_handler(CommandHandler(command, handler_fn))
+
+    # create message handlers
     regular_message_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), 
         regular_message(remote_data))
     document_handler = MessageHandler(filters.ATTACHMENT, handle_document(remote_data))
     unsupported_message_handler = MessageHandler(filters.ALL, unsupported_message)
 
-    # Add the handlers to the application
-    application.add_handler(start_handler)
-    application.add_handler(help_handler)
-    application.add_handler(new_conversation_handler)
-    application.add_handler(turbo_handler)
-    application.add_handler(no_response_handler)
-    application.add_handler(verify_handler)
+    # add message handlers
     application.add_handler(regular_message_handler)
     application.add_handler(document_handler)
     application.add_handler(unsupported_message_handler)
@@ -439,19 +474,45 @@ def setup_app():
     return application
 
 def webhook(request):
+    openai.api_key = getenv("OPENAI_API_KEY")
+    BOT_TOKEN = getenv("BOT_TOKEN")
+    bucket = getenv("BUCKET")
+
+    remote_data = RemoteData(bucket)
+    bot = ExtBot(BOT_TOKEN)
+
     if request.method == "POST":
-        app = setup_app()
-        update = Update.de_json(request.get_json(force=True), app.bot)
+        update = Update.de_json(request.get_json(force=True), bot)
+        context = FakeContext(bot, update.message, None)
+
+        # For documents
+        if update.message.document:
+            handler = handle_document
+        # For commands
+        elif update.message.text.startswith("/"):
+            command = update.message.text.split(" ", 1)[0][1:]
+            command_handlers_ = command_handlers(remote_data)
+            if command in command_handlers_:
+                handler = command_handlers_[command]
+        # For regular messages
+        elif update.message.text:
+            handler = regular_message(remote_data)
+        # Nothing else is supported
+        else:
+            handler = unsupported_message_handler
         try:
-            app.process_update(update, app.bot)
+            asyncio_run(handler(update, context=context))
             return 'okay', 200
         except Exception as e:
+            context.set_error(e)
+            asyncio_run(error_handler(update, context=context))
             return str(e), 500
     else:
         return 'error', 400
+
 
 # Set the environment variable LOCAL_MODE if you want to run the bot on a server;
 # do not set it if you want to use google cloud functions
 if getenv("LOCAL_MODE") is not None:
     if __name__ == "__main__":
-        setup_app().run_polling()
+        setup_app_polling().run_polling()
