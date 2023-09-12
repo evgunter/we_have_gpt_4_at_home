@@ -70,6 +70,12 @@ class UnverifiedException(Exception):
 class UnsupportedMessageException(Exception):
     pass
 
+class FakeTestErrorException(Exception):
+    # make a class method to store the fake error code 999
+    @classmethod
+    def code(cls):
+        return 999
+
 # the RemoteData class is for interfacing with the bucket containing user data.
 # the bucket will contain a folder for each chat the bot is in;
 # each folder will contain a file for each conversation belonging to that chat.
@@ -121,7 +127,7 @@ class RemoteData:
     def set_live_conversation(self, chat_id, conversation_id: str):
         # check if the chat_id has been verified.
         # if public access is not allowed, raise an exception if it does not (user has not been verified yet)
-        if getenv("ALLOW_PUBLIC") is None:
+        if getenv("ALLOW_PUBLIC") != "true":
             if not self.is_verified(chat_id):
                 logging.info(f"unverified chat {chat_id} tried to send a message")
                 raise UnverifiedException(chat_id)
@@ -155,7 +161,7 @@ class FakeContext(CallbackContext):
         self._error = err
 
         # if message starts with '/', it's a command
-        if message.text.startswith("/"):
+        if message.text is not None and message.text.startswith("/"):
             self._args = message.text.split(" ", 1)[1:]
         else:
             self._args = []
@@ -204,13 +210,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await admin_message(f"new chat!\nuser info: {update.effective_chat}\nchat id:", context)
     await admin_message(f"{update.effective_chat.id}", context)
 
+async def ensure_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # check if the sender is the admin
+    if update.effective_chat.id != int(getenv("ADMIN_CHAT_ID")):
+        logging.info(f"unauthorized user {update.effective_chat.id} tried to send a message")
+        await message_user(update.effective_chat.id, "nice try", context)
+        return False
+    return True
+
 def verify(remote_data: RemoteData):
     # verify the chat with the given id
     async def verify_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # check if the sender is the admin
-        if update.effective_chat.id != int(getenv("ADMIN_CHAT_ID")):
-            logging.info(f"unauthorized user {update.effective_chat.id} tried to verify a chat")
-            await message_user(update.effective_chat.id, "nice try", context)
+        if not await ensure_admin(update, context):
             return
         
         # check that the message is a chat id
@@ -243,6 +254,33 @@ def verify(remote_data: RemoteData):
     return verify_
 
 # TODO: add "unverify" command
+
+def usage_stats(remote_data: RemoteData):
+    async def usage_stats_(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await ensure_admin(update, context):
+            return
+        metrics = {}
+        # get the total number of messages from each user
+        # loop through top-level directories
+        # list top-level directories, using delimiter and prefix to emulate hierarchical structure
+
+        for blob in remote_data.bucket.list_blobs():
+            # parse this into a chat ID and timestamp; if it doesn't match that pattern (i.e. it is the source code zipfile, a 'live' file, or a 'verified' file), skip it
+            split_path = blob.name.split("/")
+            if len(split_path) != 2:
+                continue
+            chat, timestamp = split_path
+            if not timestamp.isdigit():
+                continue
+            metrics[chat] = metrics.get(chat, 0) + 1
+        
+        # format the metrics
+        metrics_str = "\n".join([f"{chat_id}: {num_msgs}" for chat_id, num_msgs in metrics.items()])
+
+        logging.info(f"usage stats: {metrics_str}")
+
+        await message_user(update.effective_chat.id, metrics_str, context)
+    return usage_stats_
     
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.debug("sinding help message")
@@ -399,30 +437,37 @@ def format_document(file_name: str, content: str, caption: Optional[str]):
                 content += f"\nDocument caption: {caption}"
     return content
 
+async def invalid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"invalid command received at {time()}: {update}")
+    await message_user(update.effective_chat.id, "sorry, i don't know that command", context)
+
 async def unsupported_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"unsupported message received at {time()}: {update}")
     await message_user(update.effective_chat.id, "sorry, i don't know how to handle that type of message", context)
 
-async def unsupported_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info(f"unsupported message received at {time()}: {update}")
-    await unsupported_message(update, context)
-
 async def error_handler(update: Optional[object], context: CallbackContext):
-    """Log the error and send a telegram message to notify the user."""
-    logging.error(msg="Exception while handling an update:", exc_info=context.error)
-    if update is not None:
-        # Check if it was an UnverifiedException
-        if isinstance(context.error, UnverifiedException):
-            logging.info(f"unverified chat {update.effective_chat.id} tried to send a message")
-            await message_user(update.effective_chat.id, "please send /start to get verified", context)
+    """Log the error and send a telegram message to notify the user. Set the status to 'okay' for expected errors, 'error' otherwise."""
+    try:
+        logging.error(msg="Exception while handling an update:", exc_info=context.error)
+        if update is not None:
+            # Check if it was an UnverifiedException
+            if isinstance(context.error, UnverifiedException):
+                logging.info(f"unverified chat {update.effective_chat.id} tried to send a message")
+                await message_user(update.effective_chat.id, "please send /start to get verified", context)
 
-        elif isinstance(context.error, UnsupportedMessageException):
-            logging.info("message is not a document")
-            await message_user(update.effective_chat.id, "sorry, i can only read documents", context)
-
+            elif isinstance(context.error, UnsupportedMessageException):
+                logging.info("message is not a document")
+                await message_user(update.effective_chat.id, "sorry, i can only read documents", context)
+                context.status = 'okay'
+            else:
+                await message_user(update.effective_chat.id, f"An error occurred: {context.error}", context)
+                context.status = 'error'
         else:
-            await message_user(update.effective_chat.id, f"An error occurred: {context.error}", context)
-    else:
-        logging.error("update is None")
+            logging.error("update is None")
+            context.status = 'error'
+    except Exception as e:
+        logging.error(f"error sending message to user: {e}")
+        context.status = 'error'
 
 
 # === OpenAI stuff =====================================================================================================
@@ -443,6 +488,7 @@ def command_handlers(remote_data: RemoteData) -> dict[str, CommandHandler]:
     TURBO_COMMAND: turbo_message(remote_data),
     NO_RESPONSE_COMMAND: no_response(remote_data),
     "verify": verify(remote_data),
+    "usage_stats": usage_stats(remote_data),
 }
 
 def setup_app_polling():
@@ -473,7 +519,8 @@ def setup_app_polling():
 
     return application
 
-def webhook(request):
+async def webhook_(request):
+    """Webhook entry point. Returns 200 even on failures, because otherwise it will retry in an undesirable way."""
     openai.api_key = getenv("OPENAI_API_KEY")
     BOT_TOKEN = getenv("BOT_TOKEN")
     bucket = getenv("BUCKET")
@@ -487,29 +534,40 @@ def webhook(request):
 
         # For documents
         if update.message.document:
-            handler = handle_document
-        # For commands
-        elif update.message.text.startswith("/"):
-            command = update.message.text.split(" ", 1)[0][1:]
-            command_handlers_ = command_handlers(remote_data)
-            if command in command_handlers_:
-                handler = command_handlers_[command]
-        # For regular messages
+            handler = handle_document(remote_data)
         elif update.message.text:
-            handler = regular_message(remote_data)
+            # For commands
+            if update.message.text.startswith("/"):
+                command = update.message.text.split(" ", 1)[0][1:]
+                command_handlers_ = command_handlers(remote_data)
+                if command in command_handlers_:
+                    handler = command_handlers_[command]
+                else:
+                    handler = invalid_command
+            # For regular messages
+            else:
+                handler = regular_message(remote_data)
         # Nothing else is supported
         else:
-            handler = unsupported_message_handler
+            handler = unsupported_message
         try:
-            asyncio_run(handler(update, context=context))
+            await handler(update, context=context)
             return 'okay', 200
+        except FakeTestErrorException as e:
+            return 'test', e.code()
         except Exception as e:
             context.set_error(e)
-            asyncio_run(error_handler(update, context=context))
-            return str(e), 500
+            await error_handler(update, context=context)
+            # check if context.status is set
+            if hasattr(context, "status"):
+                return context.status, 200
+            else:
+                return 'error', 200
     else:
         return 'error', 400
 
+def webhook(request):
+    return asyncio_run(webhook_(request))
 
 # Set the environment variable LOCAL_MODE if you want to run the bot on a server;
 # do not set it if you want to use google cloud functions
