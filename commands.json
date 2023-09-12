@@ -1,0 +1,51 @@
+{
+    "all_users": {
+        "START": {
+            "name": "start",
+            "description": "start the bot",
+            "handler": "start"
+        },
+        "HELP": {
+            "name": "help",
+            "description": "send usage message",
+            "handler": "help"
+        },
+        "TURBO": {
+            "name": "turbo",
+            "description": "send a message to gpt-3.5-turbo instead of gpt-4",
+            "handler": "turbo_message"
+        },
+        "NEW_CONVERSATION": {
+            "name": "new_conversation",
+            "description": "start a new conversation, forgetting the previous one",
+            "handler": "new_conversation"
+        },
+        "SWITCH_CONVERSATION": {
+            "name": "switch_conversation",
+            "description": "send the date and time you sent the /new_conversation command for a previous conversation in YYYY-mm-DD-HH-MM format to switch to a different conversation",
+            "handler": "switch_conversation"
+        },
+        "NO_RESPONSE": {
+            "name": "no_response",
+            "description": "send a message without requesting a response (e.g. to break up one long message into parts)",
+            "handler": "no_response"
+        },
+        "SEARCH": {
+            "name": "search",
+            "description": "search all your previous conversations for the most semantically similar one to the message you send. the first argument after the command should be the number of results you would like to request.",
+            "handler": "search_conversations"
+        }
+    },
+    "admin_only": {
+        "VERIFY": {
+            "name": "verify",
+            "description": "verify a user's identity by sending their user id",
+            "handler": "verify"
+        },
+        "USAGE_STATS": {
+            "name": "usage_stats",
+            "description": "get usage statistics for all users",
+            "handler": "usage_stats"
+        }
+    }
+}

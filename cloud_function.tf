@@ -22,6 +22,7 @@ terraform {
 variable "telegram_bot_token" {
   description = "The bot token from BotFather"
   type = string
+  sensitive = true
 }
 
 provider "telegram" {
@@ -68,6 +69,7 @@ provider "google" {
 variable "openai_api_key" {
   description = "OpenAI API key"
   type = string
+  sensitive = true
 }
 
 
@@ -79,34 +81,16 @@ resource "telegram_bot_webhook" "gptathome_webhook" {
   allowed_updates = ["message"]
 }
 
-resource "telegram_bot_commands" "gptathome_commands" {
-  commands = [
-    {
-      command = "start",
-      description = "start the bot"
-    },
-    {
-      command = "help",
-      description = "send usage message"
-    },
-    {
-      command = "new_conversation",
-      description = "start a new conversation, forgetting the previous one"
-    },
-    {
-      command = "turbo",
-      description = "send a message to gpt-3.5-turbo instead of gpt-4"
-    },
-    {
-      command = "no_response",
-      description = "send a message without requesting a response (e.g. to break up one long message into parts)"
-    },
-    {
-      command = "switch_conversation",
-      description = "send the date and time you sent the /new_conversation command for a previous conversation in YYYY-mm-DD-HH-MM format to switch to a different conversation"
-    }
-  ]
+data "local_file" "commands" {
+  filename = local.bot_config_file
 }
+
+resource "telegram_bot_commands" "gptathome_commands" {
+  # load the commands from the file commands.json, taking the "name" field as the key and "description" field as the value
+  commands = [for _, v in local.commands_json : { command = v["name"], description = v["description"] }]
+
+}
+
 
 # === SETUP RESOURCES ===
 
@@ -119,6 +103,9 @@ locals {
 
     zipped_code_local = "source_local.zip"
     zipped_code_remote = "source_remote.zip"
+
+    bot_config_file = "${path.module}/commands.json"
+    commands_json = jsondecode(data.local_file.commands.content)["all_users"]
 }
 
 # zip the code for the cloud function
@@ -169,6 +156,7 @@ resource "google_cloudfunctions_function" "function" {
     BUCKET = google_storage_bucket.bucket.name
     ADMIN_CHAT_ID = var.admin_id
     ALLOW_PUBLIC = var.allow_public
+    BOT_CONFIG_FILE = local.bot_config_file
   }
 }
 
@@ -179,4 +167,21 @@ resource "google_cloudfunctions_function_iam_member" "invoker" {
 
   role   = "roles/cloudfunctions.invoker"
   member = "allUsers"
+}
+
+
+# === OUTPUTS ===
+
+output "bucket_name" {
+  value = google_storage_bucket.bucket.name
+}
+
+output "webhook_url" {
+  value = google_cloudfunctions_function.function.https_trigger_url
+}
+
+output "environment_variables" {
+  value = join("", [for k, v in google_cloudfunctions_function.function.environment_variables : "export ${k}=${v}\n"])
+  description = "environment variables formatted as export VAR=value"
+  sensitive = true
 }

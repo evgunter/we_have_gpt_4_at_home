@@ -34,11 +34,21 @@ When the command finishes running, your bot should be ready to message!
 
 # Testing
 
-1. Uncomment the `pytest` line in `requirements.txt`.
-(You should re-comment it when deploying, since it's unnecessary then.)
+## Local testing
+1. Run `pip install -r requirements.txt && pip install pytest>=7.4.01`.
 
-2. Run `pip install -r requirements.txt`.
+2. Run `terraform output -raw environment_variables`, and copy and paste the output into your terminal. Additionally run `export LOCAL_MODE=1` if you would like to run in polling mode.
 
 3. If you would like to run the webhook test suite, run `pytest -s test.py`.
-If you would like to run locally with polling, just run the file with `python main.py`.
+If you would like to run locally with polling, run `python main.py`.
 
+## Cloud testing
+1. Run `python generate_test_terraform.py`.
+
+2. Run `cp terraform.tfvars .test_env/terraform.tfvars`.
+
+3. Create a new bot with BotFather and replace the bot token in `.test_env/terraform.tfvars` with the test bot token.
+
+4. Run `terraform init` and `terraform apply`.
+
+5. This will create and run a separate copy of the bot.
