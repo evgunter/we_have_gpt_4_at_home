@@ -2,7 +2,7 @@ import logging
 import openai
 
 from asyncio import run as asyncio_run
-from datetime import datetime
+from datetime import datetime, timezone
 from google.cloud import storage
 from json import dumps, loads
 from os import getenv, path, remove
@@ -70,6 +70,9 @@ class UnverifiedException(Exception):
 class UnsupportedMessageException(Exception):
     pass
 
+class RateLimitException(Exception):
+    pass
+
 class FakeTestErrorException(Exception):
     # make a class method to store the fake error code 999
     @classmethod
@@ -102,8 +105,14 @@ class RemoteData:
         self.write_conversation(chat_id, conversation_data)
         logging.info(f"appended to live conversation for chat {chat_id}")
 
-    def start_new_conversation(self, chat_id):
-        new_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    def start_new_conversation(self, update: Update):
+        chat_id = update.effective_chat.id
+        # get the time the message was sent, converted to utc
+        sent_time = update.message.date.astimezone(tz=timezone.utc)
+        new_id = sent_time.strftime("%Y%m%d%H%M")
+        # check if the live conversation is the same as the new conversation
+        if new_id == self.get_live_conversation(chat_id):
+            raise RateLimitException()
         self.set_live_conversation(chat_id, new_id)
         self.write_conversation(chat_id, [SYSTEM_PROMPT])
         logging.info(f"created new conversation for chat {chat_id} with id {new_id}")
@@ -288,7 +297,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def new_conversation(remote_data: RemoteData):
     async def new_conversation_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        remote_data.start_new_conversation(update.effective_chat.id)
+        remote_data.start_new_conversation(update)
         logging.debug("new conversation started")
         await message_user(update.effective_chat.id, "new conversation started", context)
     return new_conversation_
@@ -297,7 +306,7 @@ async def record_user_message(remote_data: RemoteData, update: Update, process_m
     current_chat_id = update.effective_chat.id
     live_conversation_id = remote_data.get_live_conversation(current_chat_id)
     if live_conversation_id is None:
-            live_conversation_id = remote_data.start_new_conversation(current_chat_id)
+            live_conversation_id = remote_data.start_new_conversation(update)
     remote_data.append_conversation(current_chat_id, "user", process_msg(update.message))
     logging.info(f"recorded message from chat {current_chat_id} with id {live_conversation_id}")
 
@@ -437,6 +446,67 @@ def format_document(file_name: str, content: str, caption: Optional[str]):
                 content += f"\nDocument caption: {caption}"
     return content
 
+def switch_conversation(remote_data: RemoteData):
+    usage_message = "please specify the UTC date and time you sent the /new_conversation command \
+for the desired conversation in YYYY-MM-DD-HH-MM format, \
+up to whatever specificity is needed to uniquely identify the conversation \
+(e.g. if you may send just 2023-01-31 if you only had one conversation that day)"
+
+    async def switch_conversation_(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        async def invalid_message():
+            await message_user(chat_id, usage_message, context)
+            return
+        logging.info(f"chat {chat_id} is trying to switch conversations: {context.args}")
+        # parse the date in YYYY-mm-DD-HH-MM format from the message
+        if len(context.args) != 1:
+            logging.info(f"chat {chat_id} tried to switch conversations, but provided a number of arguments not equal to 1")
+            return await invalid_message()
+        split_date = context.args[0].split("-")
+        # ensure that there are 1-5 elements
+        if len(split_date) < 1 or len(split_date) > 5:
+            logging.info(f"chat {chat_id} tried to switch conversations, but provided a date with the wrong number of elements")
+            return await invalid_message()
+        # ensure that all elements are integers, and the the first has length 4 while the others have length 2
+        if not all([x.isdigit() for x in split_date]):
+            logging.info(f"chat {chat_id} tried to switch conversations, but provided a date with non-integer elements")
+            return await invalid_message()
+        if len(split_date[0]) != 4 or not all([len(x) == 2 for x in split_date[1:]]):
+            logging.info(f"chat {chat_id} tried to switch conversations, but provided a date with elements of the wrong length")
+            return await invalid_message()
+        # convert the provided date to datetime object
+        try:
+            # datetime requires a month and day, so set those to 1 if they are not provided.
+            # this will not affect the lookup because the prefix will be taken based on which info is provided
+            if len(split_date) < 3:
+                processed_date = split_date + ["01"] * (3 - len(split_date))
+            else:
+                processed_date = split_date
+            conv_date = datetime(*[int(x) for x in processed_date])
+        except ValueError as e:
+            logging.info(f"chat {chat_id} tried to switch conversations, but conversion to a datetime failed: {e}")
+            return await invalid_message()
+        # get the conversation id prefix for the given date
+        conv_id = conv_date.strftime("".join(["%Y","%m","%d","%H","%M"][:len(split_date)]))
+        # determine if this uniquely identifies a conversation
+        conv_id_prefix = f"{chat_id}/{conv_id}"
+        blobs = list(remote_data.bucket.list_blobs(prefix=conv_id_prefix))
+        if len(blobs) == 0:
+            logging.info(f"chat {chat_id} tried to switch conversations, but there are no conversations for datetime {conv_date}")
+            await message_user(chat_id, f"no conversations for given time", context)
+            return
+        elif len(blobs) > 1:
+            logging.info(f"chat {chat_id} tried to switch conversations, but there are multiple conversations for datetime {conv_date}")
+            await message_user(chat_id, f"multiple conversations for given time: please specify with more precision, \
+e.g. YYYY-MM-DD-HH-MM if there were multiple conversations in one hour", context)
+            return
+        # set the live conversation to the identified conversation id
+        full_conv_id = blobs[0].name.split("/")[-1]
+        remote_data.set_live_conversation(chat_id, full_conv_id)
+        logging.info(f"chat {chat_id} switched to conversation {full_conv_id}")
+        await message_user(chat_id, "conversation switched", context)
+    return switch_conversation_
+
 async def invalid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"invalid command received at {time()}: {update}")
     await message_user(update.effective_chat.id, "sorry, i don't know that command", context)
@@ -454,10 +524,13 @@ async def error_handler(update: Optional[object], context: CallbackContext):
             if isinstance(context.error, UnverifiedException):
                 logging.info(f"unverified chat {update.effective_chat.id} tried to send a message")
                 await message_user(update.effective_chat.id, "please send /start to get verified", context)
-
             elif isinstance(context.error, UnsupportedMessageException):
                 logging.info("message is not a document")
                 await message_user(update.effective_chat.id, "sorry, i can only read documents", context)
+                context.status = 'okay'
+            elif isinstance(context.error, RateLimitException):
+                logging.info("new conversation rate limit exceeded")
+                await message_user(update.effective_chat.id, "slow down there!", context)
                 context.status = 'okay'
             else:
                 await message_user(update.effective_chat.id, f"An error occurred: {context.error}", context)
@@ -485,6 +558,7 @@ def command_handlers(remote_data: RemoteData) -> dict[str, CommandHandler]:
     "start": start,
     "help": help,
     "new_conversation": new_conversation(remote_data),
+    "switch_conversation": switch_conversation(remote_data),
     TURBO_COMMAND: turbo_message(remote_data),
     NO_RESPONSE_COMMAND: no_response(remote_data),
     "verify": verify(remote_data),

@@ -100,6 +100,10 @@ resource "telegram_bot_commands" "gptathome_commands" {
     {
       command = "no_response",
       description = "send a message without requesting a response (e.g. to break up one long message into parts)"
+    },
+    {
+      command = "switch_conversation",
+      description = "send the date and time you sent the /new_conversation command for a previous conversation in YYYY-mm-DD-HH-MM format to switch to a different conversation"
     }
   ]
 }
