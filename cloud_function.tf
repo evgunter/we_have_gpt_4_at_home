@@ -95,16 +95,18 @@ resource "telegram_bot_commands" "gptathome_commands" {
 # === SETUP RESOURCES ===
 
 locals {
+    bot_config_file = "commands.json"
+
     code_files  = [
         "main.py",
-        "requirements.txt"
+        "requirements.txt",
+        local.bot_config_file,
     ]
     source_code_sha1 = sha1(join("", [for f in local.code_files : filesha1(f)]))
 
     zipped_code_local = "source_local.zip"
     zipped_code_remote = "source_remote.zip"
 
-    bot_config_file = "${path.module}/commands.json"
     commands_json = jsondecode(data.local_file.commands.content)["all_users"]
 }
 

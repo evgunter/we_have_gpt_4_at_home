@@ -1,0 +1,10 @@
+name: we_have_chat_gpt_at_home
+channels:
+  - conda-forge
+dependencies:
+  - google-cloud-storage
+  - openai
+  - python-telegram-bot
+  - tiktoken
+  - pytest
+  - numpy

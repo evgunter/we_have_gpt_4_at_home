@@ -1,4 +1,5 @@
 import logging
+import numpy as np
 import openai
 
 from asyncio import run as asyncio_run
@@ -15,7 +16,7 @@ from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CallbackContext, ContextTypes, CommandHandler, ExtBot, MessageHandler, filters
 from tiktoken import encoding_for_model
 from time import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable
 
 
 # === Setup ===========================================================================================================
@@ -48,6 +49,9 @@ SYSTEM_PROMPT = {"role": "system", "content": "You are a helpful Telegram chatbo
 
 HELP_MESSAGE = "i'm a chatbot for interfacing with openai's api.\n\nby default, i respond to direct messages with `gpt-4`; you can also use the /turbo command to send a message to `gpt-3.5-turbo` instead (or, if your message is sufficiently long, `gpt-3.5-turbo-16k`).\n\ni can also read documents, which you can send to me as attachments. i'll respond to the document if it has a caption, or just acknowledge receipt if it doesn't.\n\ni remember your messages until you send me a /new\_conversation command, at which point i'll forget everything you've said before."
 
+DATETIME_CONV_FORMAT = "%Y%m%d%H%M"
+DATETIME_IN_FORMAT = "%Y-%m-%d-%H-%M"
+
 class Message:
     def __init__(self, message_id, message_text):
         self.message_id = message_id
@@ -71,6 +75,7 @@ class Responses():
 class UserReplies():
     UNSUPPORTED = "sorry, i can only read documents"
     RATE_LIMIT = "slow down there!"
+    NON_ADMIN = "nice try"
 
 # https://github.com/python-telegram-bot/python-telegram-bot/wiki/Extensions-%E2%80%93-Your-first-Bot
 
@@ -98,6 +103,9 @@ class FakeTestErrorException(Exception):
     code = Responses.TEST
 
 class InvalidJSONException(Exception):
+    pass
+
+class TooLongEmbeddingException(Exception):
     pass
 
 # the RemoteData class is for interfacing with the bucket containing user data.
@@ -135,7 +143,7 @@ class RemoteData:
         chat_id = update.effective_chat.id
         # get the time the message was sent, converted to utc
         sent_time = update.message.date.astimezone(tz=timezone.utc)
-        new_id = sent_time.strftime("%Y%m%d%H%M")
+        new_id = sent_time.strftime(DATETIME_CONV_FORMAT)
         # check if the live conversation is the same as the new conversation
         if new_id == self.get_live_conversation(chat_id):
             raise RateLimitException()
@@ -189,11 +197,17 @@ class RemoteData:
     def create_embedding(self, chat_id, conv_id):
         logging.info(f"creating embedding for conversation {chat_id}/{conv_id}")
         content = self.read_conversation(chat_id, conv_id)
+        # remove SYSTEM_PROMPT from the start of the conversation
+        if not content[0] == SYSTEM_PROMPT:
+            logging.warning(f"conversation {chat_id}/{conv_id} does not start with SYSTEM_PROMPT")
+            cleaned_content = content
+        else:
+            cleaned_content = content[1:]
         try:
-            query = dumps(content)
+            query = dumps(cleaned_content)
         except JSONDecodeError:
             raise InvalidJSONException()
-        embedding_text = dumps(query_embeddings_model(query, model=EMBEDDINGS_MODEL))
+        embedding_text = dumps(list(query_embeddings_model(query, model=EMBEDDINGS_MODEL)))
         destination_blob_name = f"{embeddings_info_path(chat_id)}/{conv_id}"
         blob = self.bucket.blob(destination_blob_name)
         blob.upload_from_string(embedding_text)
@@ -238,7 +252,7 @@ class FakeContext(CallbackContext):
     def set_error(self, err):
         self._error = err
 
-async def message_user(chat_id: int, msg: str, context: ContextTypes.DEFAULT_TYPE, parse_mode=ParseMode.MARKDOWN):
+async def message_user(chat_id: str, msg: str, context: ContextTypes.DEFAULT_TYPE, parse_mode=ParseMode.MARKDOWN):
     logging.debug(f"sending message to chat {chat_id}: {msg}")
 
     try:
@@ -257,7 +271,7 @@ async def message_user(chat_id: int, msg: str, context: ContextTypes.DEFAULT_TYP
 
 async def admin_message(msg: str, context: ContextTypes.DEFAULT_TYPE):
     logging.debug(f"sending admin message: {msg}")
-    await message_user(int(getenv("ADMIN_CHAT_ID")), msg, context)
+    await message_user(getenv("ADMIN_CHAT_ID"), msg, context)
 
 def start(_):
     async def start_(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -269,15 +283,13 @@ def start(_):
         await admin_message(f"{update.effective_chat.id}", context)
     return start_
 
-def ensure_admin(_):
-    async def ensure_admin_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # check if the sender is the admin
-        if update.effective_chat.id != int(getenv("ADMIN_CHAT_ID")):
-            logging.info(f"unauthorized user {update.effective_chat.id} tried to send a message")
-            await message_user(update.effective_chat.id, "nice try", context)
-            return False
-        return True
-    return ensure_admin_
+async def ensure_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # check if the sender is the admin
+    if str(update.effective_chat.id) != getenv("ADMIN_CHAT_ID"):
+        logging.info(f"unauthorized user {update.effective_chat.id} tried to send a message")
+        await message_user(update.effective_chat.id, UserReplies.NON_ADMIN, context)
+        return False
+    return True
 
 def verify(remote_data: RemoteData):
     # verify the chat with the given id
@@ -291,7 +303,7 @@ def verify(remote_data: RemoteData):
             await admin_message_err()
             return
         try:
-            chat_id = int(context.args[0])
+            chat_id = context.args[0]
         except ValueError:
             logging.info(f"admin {update.effective_chat.id} tried to verify a chat, but gave an invalid chat id")
             await admin_message_err()
@@ -345,9 +357,10 @@ def help(_):
 
 def new_conversation(remote_data: RemoteData):
     async def new_conversation_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        remote_data.start_new_conversation(update)
-        logging.debug("new conversation started")
-        await message_user(update.effective_chat.id, "new conversation started", context)
+        new_id = remote_data.start_new_conversation(update)
+        logging.debug(f"new conversation started: {new_id}")
+        await message_user(update.effective_chat.id, "started new conversation with id:", context)
+        await message_user(update.effective_chat.id, datetime.strftime(datetime.strptime(new_id, DATETIME_CONV_FORMAT), DATETIME_IN_FORMAT), context)
     return new_conversation_
 
 async def record_user_message(remote_data: RemoteData, update: Update, process_msg=lambda msg: msg.text):
@@ -566,10 +579,10 @@ e.g. YYYY-MM-DD-HH-MM if there were multiple conversations in one hour", context
 
 def format_search_results(top_results: List[Tuple[str, float]]):
     """format the results, converting the conversation ids to datetimes"""
-    formatted_results = [(datetime.strptime(conv_id, "%Y%m%d%H%M"), sim) for conv_id, sim in top_results]
+    formatted_results = [(datetime.strftime(datetime.strptime(conv_id, DATETIME_CONV_FORMAT), DATETIME_IN_FORMAT), sim) for conv_id, sim in top_results]
     return "\n".join([f"{conv_id}: {sim}" for conv_id, sim in formatted_results])
 
-def search_conversations(remote_data: RemoteData):
+def search_conversations(remote_data: RemoteData, filter: Callable[[str], bool] = lambda x: True):
     # finds the user's top n conversations with the closest embedding to the given query
     async def search_conversations_(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info(f"chat {update.effective_chat.id} is trying to search conversations: {context.args}")
@@ -585,7 +598,7 @@ def search_conversations(remote_data: RemoteData):
         # find the rest of the message, cutting off the command and number of results requested
         content_index = update.message.text.find(c00) + len(c00) + 1
         query = update.message.text[content_index:]
-        query_embedding = query_embeddings_model(dumps({"role": "user", "content": query}), model=EMBEDDINGS_MODEL)
+        query_embedding = query_embeddings_model(dumps([{"role": "user", "content": query}]), model=EMBEDDINGS_MODEL)
         # for each conversation, read or create the embedding and compute the similarity
         results = []
         for blob in remote_data.bucket.list_blobs(prefix=f"{update.effective_chat.id}"):
@@ -595,6 +608,11 @@ def search_conversations(remote_data: RemoteData):
                 continue
             # get the conversation id
             conv_id = split_path[1]
+
+            # check that this matches the filter
+            if not filter(conv_id):
+                continue
+
             # check if an embedding has already been created at chat_id/info/embeddings/conversation_id
             embedding_blob = remote_data.bucket.blob(f"{embeddings_info_path(update.effective_chat.id)}/{conv_id}")
             if not embedding_blob.exists():
@@ -605,7 +623,7 @@ def search_conversations(remote_data: RemoteData):
                 except InvalidJSONException:
                     continue
             # read the embedding
-            embedding = loads(embedding_blob.download_as_bytes())
+            embedding = np.array(loads(embedding_blob.download_as_bytes()))
             # compute the similarity
             sim = cosine_similarity(query_embedding, embedding)
             # add the result to the list
@@ -636,24 +654,24 @@ async def error_handler(update: Optional[object], context: CallbackContext):
             if isinstance(context.error, UnverifiedException):
                 logging.info(f"unverified chat {update.effective_chat.id} tried to send a message")
                 await message_user(update.effective_chat.id, f"please send /{Commands.START} to get verified", context)
-                context.status = 'unverified'
+                context.status = Responses.UNVERIFIED[0]
             elif isinstance(context.error, UnsupportedMessageException):
                 logging.info("message is not a document")
                 await message_user(update.effective_chat.id, UserReplies.UNSUPPORTED, context)
-                context.status = 'unsupported'
+                context.status = Responses.UNSUPPORTED[0]
             elif isinstance(context.error, RateLimitException):
                 logging.info("new conversation rate limit exceeded")
                 await message_user(update.effective_chat.id, UserReplies.RATE_LIMIT, context)
-                context.status = 'rate_limit'
+                context.status = Responses.RATE_LIMIT[0]
             else:
                 await message_user(update.effective_chat.id, f"An error occurred: {context.error}", context)
-                context.status = 'internal_error'
+                context.status = Responses.INTERNAL_ERROR[0]
         else:
             logging.error("update is None")
-            context.status = 'none_update'
+            context.status = Responses.NONE_UPDATE[0]
     except Exception as e:
         logging.error(f"error sending message to user: {e}")
-        context.status = 'meta_error'
+        context.status = Responses.META_ERROR[0]
 
 
 # === OpenAI stuff =====================================================================================================
@@ -663,13 +681,16 @@ def query_model(previous_messages, model=MODEL):
     logging.info(f"got response: {response}")
     return response['choices'][0]['message']['content']
 
-def query_embeddings_model(previous_messages, model=EMBEDDINGS_MODEL):
+def query_embeddings_model(previous_messages, model=EMBEDDINGS_MODEL, average_ok=True):
+    print(f"previous messages: {previous_messages}")  # TODO remove
     max_tokens = MODEL_DATA[model]["max_tokens"]
     stringified_messages = dumps(previous_messages)
     token_num = count_tokens(stringified_messages, model)
     if token_num <= MODEL_DATA[model]["max_tokens"]:
         texts_to_get = [(stringified_messages, token_num)]
     else:
+        if not average_ok:
+            raise TooLongEmbeddingException()
         texts_to_get = []
         # split the messages into chunks of no more than max_tokens tokens, cleaving at message boundaries if possible
         
@@ -720,31 +741,37 @@ def query_embeddings_model(previous_messages, model=EMBEDDINGS_MODEL):
     
     embeddings = get_embeddings([txt for txt, _ in texts_to_get], model='text-embedding-ada-002')
     logging.info(f"got embeddings response: {embeddings}")
+
+    weights = np.array([n_tokens for _, n_tokens in texts_to_get])
+
+    # embeddings has shape (n_texts, n_embedding_dimensions); weights has shape (n_texts,)
+    weighted_embeddings = np.array(embeddings) * weights[:, np.newaxis]
     
     # average the embeddings, weighted by the number of tokens in each
-    weighted_embeddings = [emb * n_tokens for emb, (_, n_tokens) in zip(embeddings, texts_to_get)]
-    average_embedding = sum(weighted_embeddings) / sum([n_tokens for _, n_tokens in texts_to_get])
+    average_embedding = np.sum(weighted_embeddings, axis=0) / np.sum(weights)
 
     return average_embedding    
 
 # you can use openai.embeddings_utils.get_embeddings for this, but it pulls in a ton of dependencies
 def get_embeddings(txts, model='text-embedding-ada-002'):
-   return openai.Embedding.create(input=txts, model=model)['data'][0]['embedding']
+    emb = openai.Embedding.create(input=txts, model=model)['data'][0]['embedding']
+    # ensure the output is a list of vectors, even if txts is a singleton
+    if emb:
+        if isinstance(emb, list) and emb and isinstance(emb[0], list):  # result is a list of embeddings
+            return [np.array(e) for e in emb]
+        else:  # result is a single embedding
+            return [np.array(emb)]
+    else:
+        return []
 
 # you can use openai.embeddings_utils.cosine_similarity for this, but it pulls in a ton of dependencies
-def cosine_similarity(emb1: List[float], emb2: List[float]):
-    # assert that emb1 and emb2 are both lists of floats of the same length
-    assert isinstance(emb1, list) and isinstance(emb2, list)
-    assert len(emb1) == len(emb2)
-    assert all([isinstance(v, float) for v in emb1]) and all([isinstance(v, float) for v in emb2])
-    def sq_norm(vs):
-        return sum([pow(v, 2) for v in vs])
-    emb1_norm = pow(sq_norm(emb1), 0.5)
-    emb1_normed = [v/emb1_norm for v in emb1]
-    emb2_norm = pow(sq_norm(emb2), 0.5)
-    emb2_normed = [v/emb2_norm for v in emb2]
-    # cosine_similarity = 1 - normed_euclidean_distance/2
-    return 1 - sq_norm([v1 - v2 for v1, v2 in zip(emb1_normed, emb2_normed)])/2
+def cosine_similarity(emb1: np.ndarray, emb2: np.ndarray):
+    # assert that emb1 and emb2 are both numpy arrays of the same shape, which is a 1d array of floats
+    assert isinstance(emb1, np.ndarray) and isinstance(emb2, np.ndarray)
+    assert emb1.shape == emb2.shape
+    assert len(emb1.shape) == 1
+    return np.dot(emb1, emb2)/(np.linalg.norm(emb1, 2) * np.linalg.norm(emb2, 2))
+
 
 # === Main =============================================================================================================
 
@@ -849,6 +876,7 @@ async def webhook_(request):
             await handler(update, context=context)
             return 'okay', 200
         except FakeTestErrorException as e:
+            logging.info(f"caught fake test error: {e}")
             return Responses.TEST
         except Exception as e:
             context.set_error(e)

@@ -1,6 +1,7 @@
 google-cloud-storage>=2.10.0
 openai>=0.28.0
-# openai[embeddings]  # pulls in a ton of requiremnts; commented out so that it doesn't slow down installation
+# openai[embeddings]  # pulls in a ton of requirements; commented out so that it doesn't slow down installation
 python-telegram-bot>=20.5
 tiktoken>=0.4.0
 # pytest>=7.4.0  # only used in testing; commented out so that it doesn't slow down installation
+numpy>=1.26.0
