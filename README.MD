@@ -37,7 +37,7 @@ When the command finishes running, your bot should be ready to message!
 ## Local testing
 1. Run `pip install -r requirements.txt && pip install pytest>=7.4.01`.
 
-2. Run `terraform output -raw environment_variables`, and copy and paste the output into your terminal. Additionally run `export LOCAL_MODE=1` if you would like to run in polling mode.
+2. Run `$(terraform output -raw environment_variables)`. Additionally run `export LOCAL_MODE=1` if you would like to run in polling mode.
 
 3. If you would like to run the webhook test suite, run `pytest -s test.py`.
 If you would like to run locally with polling, run `python main.py`.

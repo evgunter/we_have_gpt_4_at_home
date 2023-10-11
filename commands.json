@@ -1,4 +1,28 @@
-{
+{   
+    "default": {
+        "model": "gpt-4",
+        "alternates": ["gpt-4-32k"]
+    },
+    "embeddings_default": {
+        "model": "text-embedding-ada-002"
+    },
+    "models": {
+        "TURBO": {
+            "name": "turbo",
+            "model": "gpt-3.5-turbo",
+            "alternates": ["gpt-3.5-turbo-16k"]
+        },
+        "BASE": {
+            "name": "base",
+            "model": "davinci-002",
+            "alternates": []
+        },
+        "INSTRUCT": {
+            "name": "instruct",
+            "model": "gpt-3.5-turbo-instruct",
+            "alternates": []
+        }
+    },
     "all_users": {
         "START": {
             "name": "start",
@@ -9,11 +33,6 @@
             "name": "help",
             "description": "send usage message",
             "handler": "help"
-        },
-        "TURBO": {
-            "name": "turbo",
-            "description": "send a message to gpt-3.5-turbo instead of gpt-4",
-            "handler": "turbo_message"
         },
         "NEW_CONVERSATION": {
             "name": "new_conversation",
@@ -29,6 +48,11 @@
             "name": "no_response",
             "description": "send a message without requesting a response (e.g. to break up one long message into parts)",
             "handler": "no_response"
+        },
+        "BAMBOOZLE": {
+            "name": "bamboozle",
+            "description": "record a message as though it was sent by the assistant rather than the user",
+            "handler": "bamboozle"
         },
         "SEARCH": {
             "name": "search",

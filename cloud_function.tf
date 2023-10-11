@@ -87,8 +87,7 @@ data "local_file" "commands" {
 
 resource "telegram_bot_commands" "gptathome_commands" {
   # load the commands from the file commands.json, taking the "name" field as the key and "description" field as the value
-  commands = [for _, v in local.commands_json : { command = v["name"], description = v["description"] }]
-
+  commands = concat(local.all_users_desc, local.models_desc)
 }
 
 
@@ -107,7 +106,9 @@ locals {
     zipped_code_local = "source_local.zip"
     zipped_code_remote = "source_remote.zip"
 
-    commands_json = jsondecode(data.local_file.commands.content)["all_users"]
+    config = jsondecode(data.local_file.commands.content)
+    models_desc = [for _, v in local.config["models"] : { command = v["name"], description = "send a message to ${v["model"]} instead of ${local.config["default"]["model"]}" }]
+    all_users_desc = [for _, v in local.config["all_users"] : { command = v["name"], description = v["description"] }]
 }
 
 # zip the code for the cloud function

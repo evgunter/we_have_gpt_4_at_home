@@ -5,7 +5,7 @@ import openai
 from asyncio import run as asyncio_run
 from datetime import datetime, timezone
 from google.cloud import storage
-from json import dumps, JSONDecodeError, load, loads
+from json import dumps, load, loads
 # from openai.embeddings_utils import get_embeddings, cosine_similarity
 from os import getenv, path, remove
 from random import choices as rand_choices
@@ -16,46 +16,52 @@ from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CallbackContext, ContextTypes, CommandHandler, ExtBot, MessageHandler, filters
 from tiktoken import encoding_for_model
 from time import time
-from typing import List, Optional, Tuple, Callable
+from typing import List, Optional, Tuple, Callable, Dict
 
 
 # === Setup ===========================================================================================================
 
-MODEL = "gpt-4"  # "text-davinci-003"
-LONG_MODEL = "gpt-4-32k"
-FAST_MODEL = "gpt-3.5-turbo"
-LONG_FAST_MODEL = "gpt-3.5-turbo-16k"
-EMBEDDINGS_MODEL = "text-embedding-ada-002"
+# filled in based on commands.json
+DEFAULT_MODELS = []
+EMBEDDINGS_MODELS = []
 
 MODEL_DATA = {
     "gpt-4": {
         "max_tokens": 8192,
+        "mode": "chat",
     },
     "gpt-4-32k": {
         "max_tokens": 32768,
+        "mode": "chat",
     },
     "gpt-3.5-turbo": {
         "max_tokens": 4097,
+        "mode": "chat",
     },
     "gpt-3.5-turbo-16k" : {
         "max_tokens": 16385,
+        "mode": "chat",
+    },
+    "davinci-002": {
+        "max_tokens": 16384,
+        "mode": "completion",
+    },
+    "gpt-3.5-turbo-instruct": {
+        "max_tokens": 4097,
+        "mode": "completion",
     },
     "text-embedding-ada-002": {
         "max_tokens": 8191,
+        "mode": "embeddings"
     },
 }
 
 SYSTEM_PROMPT = {"role": "system", "content": "You are a helpful Telegram chatbot. You can use Telegram markdown message formatting, e.g. `inline code`, ```c++\ncode written in c++```, *bold*, and _italic_."}
 
-HELP_MESSAGE = "i'm a chatbot for interfacing with openai's api.\n\nby default, i respond to direct messages with `gpt-4`; you can also use the /turbo command to send a message to `gpt-3.5-turbo` instead (or, if your message is sufficiently long, `gpt-3.5-turbo-16k`).\n\ni can also read documents, which you can send to me as attachments. i'll respond to the document if it has a caption, or just acknowledge receipt if it doesn't.\n\ni remember your messages until you send me a /new\_conversation command, at which point i'll forget everything you've said before."
+HELP_MESSAGE = "i'm a chatbot for interfacing with openai's api.\n\nby default, i respond to direct messages with `gpt-4`; you can also use other models with /turbo for `gpt-3.5-turbo` or /base for davinci-002 (it will also use the corresponding model with a longer context window as necessary).\n\ni can also read plain text documents, which you can send to me as attachments. i'll respond to the document if it has a caption, or just acknowledge receipt if it doesn't.\n\ni remember your messages until you send me a /new\_conversation command, at which point i'll forget everything you've said before."
 
 DATETIME_CONV_FORMAT = "%Y%m%d%H%M"
 DATETIME_IN_FORMAT = "%Y-%m-%d-%H-%M"
-
-class Message:
-    def __init__(self, message_id, message_text):
-        self.message_id = message_id
-        self.message_text = message_text
 
 class Responses():
     # has a class attribute for each of the possible outputs that go along with a status code    
@@ -106,6 +112,9 @@ class InvalidJSONException(Exception):
     pass
 
 class TooLongEmbeddingException(Exception):
+    pass
+
+class NoResponseException(Exception):
     pass
 
 # the RemoteData class is for interfacing with the bucket containing user data.
@@ -196,18 +205,10 @@ class RemoteData:
         
     def create_embedding(self, chat_id, conv_id):
         logging.info(f"creating embedding for conversation {chat_id}/{conv_id}")
-        content = self.read_conversation(chat_id, conv_id)
-        # remove SYSTEM_PROMPT from the start of the conversation
-        if not content[0] == SYSTEM_PROMPT:
-            logging.warning(f"conversation {chat_id}/{conv_id} does not start with SYSTEM_PROMPT")
-            cleaned_content = content
-        else:
-            cleaned_content = content[1:]
-        try:
-            query = dumps(cleaned_content)
-        except JSONDecodeError:
-            raise InvalidJSONException()
-        embedding_text = dumps(list(query_embeddings_model(query, model=EMBEDDINGS_MODEL)))
+        messages = self.read_conversation(chat_id, conv_id)
+        # format the messages: remove SYSTEM_PROMPT from the start of the conversation, convert to non-json, etc
+        query = base_format(messages)
+        embedding_text = dumps(list(query_embeddings_model(query, model=EMBEDDINGS_MODELS[0])))
         destination_blob_name = f"{embeddings_info_path(chat_id)}/{conv_id}"
         blob = self.bucket.blob(destination_blob_name)
         blob.upload_from_string(embedding_text)
@@ -354,6 +355,7 @@ def help(_):
     async def help_(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.debug("sending help message")
         await message_user(update.effective_chat.id, HELP_MESSAGE, context)
+    return help_
 
 def new_conversation(remote_data: RemoteData):
     async def new_conversation_(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,13 +365,16 @@ def new_conversation(remote_data: RemoteData):
         await message_user(update.effective_chat.id, datetime.strftime(datetime.strptime(new_id, DATETIME_CONV_FORMAT), DATETIME_IN_FORMAT), context)
     return new_conversation_
 
-async def record_user_message(remote_data: RemoteData, update: Update, process_msg=lambda msg: msg.text):
+async def record_message(remote_data: RemoteData, update: Update, role, content):
     current_chat_id = update.effective_chat.id
     live_conversation_id = remote_data.get_live_conversation(current_chat_id)
     if live_conversation_id is None:
             live_conversation_id = remote_data.start_new_conversation(update)
-    remote_data.append_conversation(current_chat_id, "user", process_msg(update.message))
+    remote_data.append_conversation(current_chat_id, role, content)
     logging.info(f"recorded message from chat {current_chat_id} with id {live_conversation_id}")
+
+async def record_user_message(remote_data: RemoteData, update: Update, process_msg=lambda msg: msg.text):
+    return await record_message(remote_data, update, "user", process_msg(update.message))
 
 def count_tokens(text: str, model: str):
     enc = encoding_for_model(model)
@@ -380,38 +385,40 @@ def get_n_tokens(text: str, model: str, n: int):
     tokenized_text = enc.encode(text)[:n]
     return enc.decode(tokenized_text)
 
-async def respond_conversation(remote_data: RemoteData, current_chat_id: int, context: ContextTypes.DEFAULT_TYPE, model=MODEL):
+async def respond_conversation(remote_data: RemoteData, current_chat_id: int, context: ContextTypes.DEFAULT_TYPE, models=None):
+    if models is None:
+        models = DEFAULT_MODELS
     chat_history = remote_data.read_live_conversation(current_chat_id)
 
-    # use the long context model if necessary; error if that's not sufficient
-    max_tokens = MODEL_DATA[model]["max_tokens"]
+    # use a longer context model if necessary; error if that's not sufficient
+    if not models:
+        logging.error(f"no models provided")
+        await message_user(current_chat_id, f"no models provided", context, parse_mode=None)
+        return
 
-    # for the ChatCompletion models, this isn't the exact number of tokens, but it's kind of unclear how to actually get that value.
-    # this should at least err in the direction of overcounting tokens, which is ok since we need some space for a response.
-    token_num = count_tokens(dumps(chat_history), model)
-    if token_num > max_tokens:
-        logging.info(f"chat history is {token_num} tokens, which is more than the {max_tokens} token limit; trying long context model")
-        if model == MODEL:
-            model = LONG_MODEL
-        elif model == FAST_MODEL:
-            model = LONG_FAST_MODEL
-        else:
-            logging.error("invalid model")
-            raise Exception("invalid model")
-        # check that the long context model is sufficient
+    for model in models:
+        # for the ChatCompletion models, this isn't the exact number of tokens, but it's kind of unclear how to actually get that value.
+        # this should at least err in the direction of overcounting tokens, which is ok since we need some space for a response.
+        token_num = count_tokens(dumps(chat_history), model)  # probably all the sequences of models will use the same tokenizer, but do this inside the loop just in case
+
         max_tokens = MODEL_DATA[model]["max_tokens"]
-        if token_num > max_tokens:
-            logging.error(f"chat history is {token_num} tokens, which is more than the {max_tokens} token limit; giving up")
-            await message_user(current_chat_id, f"chat history is {token_num} tokens, which is more than the {max_tokens} token limit", context, parse_mode=None)
-            return
+        if token_num <= max_tokens:  # this length suffices
+            break
+        logging.info(f"chat history is {token_num} tokens, which is more than the {max_tokens} token limit; trying longer context model...")
+    else:
+        logging.error(f"chat history is {token_num} tokens, which is more than the {max_tokens} token limit; giving up")
+        await message_user(current_chat_id, f"chat history is {token_num} tokens, which is more than the {max_tokens} token limit", context, parse_mode=None)
+        return
     
     # query the model
     logging.info(f"querying model {model}...")
     try:
         response = query_model(chat_history, model=model)
+    except NoResponseException:  # don't log anything if the model didn't respond
+        logging.info("model provided an empty response")
+        await message_user(current_chat_id, "[no response]", context, parse_mode=None)
+        return
     except Exception as e:
-        # TODO: should maybe give some option to remove the last response so it doesn't ruin the whole conversaion,
-        #   if that turns out to be a problem
         logging.error(e)
         await message_user(current_chat_id, f"model failed with error: {e}", context, parse_mode=None)
         return
@@ -422,42 +429,48 @@ async def respond_conversation(remote_data: RemoteData, current_chat_id: int, co
     # reply to the user
     await message_user(current_chat_id, response, context)
 
-async def regular_message_core(remote_data: RemoteData, update: Update, context: ContextTypes.DEFAULT_TYPE, process_msg=lambda msg: msg.text, model=MODEL):
+async def regular_message_core(remote_data: RemoteData, update: Update, context: ContextTypes.DEFAULT_TYPE, process_msg=lambda msg: msg.text, models=None):
+    if models is None:
+        models = DEFAULT_MODELS
     logging.info(f"update received at {time()}: {update}")
     
     await record_user_message(remote_data, update, process_msg)
     current_chat_id = update.effective_chat.id
-    await respond_conversation(remote_data, current_chat_id, context, model)
+    await respond_conversation(remote_data, current_chat_id, context, models)
 
 def regular_message(remote_data: RemoteData):
     async def regular_message_(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await regular_message_core(remote_data, update, context)
     return regular_message_
 
-def is_turbo(text: str):
-    return text.startswith(f"/{Commands.TURBO}")
+def is_command(command: str, text: str):
+    return text.startswith(f"/{command}"), text[len(command) + 2:]
 
-def remove_turbo(text: str):
-    return text[len(Commands.TURBO) + 2:]
-
-def turbo_message(remote_data: RemoteData):
-    async def turbo_message_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logging.info("turbo message received")
-        await regular_message_core(remote_data, update, context, process_msg=lambda msg: remove_turbo(msg.text), model=FAST_MODEL)
-    return turbo_message_
+def model_message_gen(name: str, models: List[str]):
+    def model_message(remote_data: RemoteData):
+        async def model_message_(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            logging.info(f"{name} message received")
+            await regular_message_core(remote_data, update, context, process_msg=lambda msg: is_command(name, msg.text)[1], models=models)
+        return model_message_
+    return model_message
 
 def no_response(remote_data: RemoteData):
     async def no_response_(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info(f"message with no response requested received at {time()}: {update}")
-        def removenoresponsecommand(msg):
-            return msg.text[len(Commands.NO_RESPONSE) + 2:]
 
-        await record_user_message(remote_data, update, process_msg=removenoresponsecommand)
+        await record_user_message(remote_data, update, process_msg=lambda msg: is_command(Commands.NO_RESPONSE, msg.text)[1])
     return no_response_
+
+def bamboozle(remote_data: RemoteData):
+    """Record a user message as though it was sent by the bot."""
+    async def bamboozle_(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logging.info(f"bamboozlement received at {time()}: {update}")
+        await record_message(remote_data, update, "assistant", is_command(Commands.BAMBOOZLE, update.message.text)[1])
+    return bamboozle_
 
 async def record_document(remote_data: RemoteData, update: Update):
     content = await read_document(update.message)
-    await record_user_message(remote_data, update, process_msg=lambda msg: format_document(msg.document.file_name, content, msg.caption))
+    await record_user_message(remote_data, update, process_msg=lambda msg: format_document(msg.document.file_name, content))
 
 def handle_document(remote_data: RemoteData):
     async def handle_document_(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -469,12 +482,12 @@ def handle_document(remote_data: RemoteData):
         # if the document has a caption, respond to the document; otherwise, just acknowledge receipt
         if update.message.caption is not None:
             logging.info("document with caption received")
-            if is_turbo(update.message.caption):
-                logging.info("responding to turbo document")
-                model = FAST_MODEL
-            else:
-                model = MODEL
-            await respond_conversation(remote_data, current_chat_id, context, model=model)
+            # create a new message which is identical to the first except that
+            # the text field is filled in from the caption, and the original document and caption are gone
+            new_msg = Message(update.message.message_id, update.message.date, update.message.chat, from_user=update.message.from_user, forward_from=update.message.forward_from, forward_from_chat=update.message.forward_from_chat, forward_date=update.message.forward_date, reply_to_message=update.message.reply_to_message, edit_date=update.message.edit_date, text=update.message.caption, entities=update.message.caption_entities, audio=update.message.audio, game=update.message.game, photo=update.message.photo, sticker=update.message.sticker, video=update.message.video, voice=update.message.voice, video_note=update.message.video_note, contact=update.message.contact, location=update.message.location, venue=update.message.venue, new_chat_members=update.message.new_chat_members, left_chat_member=update.message.left_chat_member, new_chat_title=update.message.new_chat_title, new_chat_photo=update.message.new_chat_photo, delete_chat_photo=update.message.delete_chat_photo, group_chat_created=update.message.group_chat_created, supergroup_chat_created=update.message.supergroup_chat_created, channel_chat_created=update.message.channel_chat_created, migrate_to_chat_id=update.message.migrate_to_chat_id, migrate_from_chat_id=update.message.migrate_from_chat_id, pinned_message=update.message.pinned_message, invoice=update.message.invoice, successful_payment=update.message.successful_payment, connected_website=update.message.connected_website, passport_data=update.message.passport_data, reply_markup=update.message.reply_markup)
+            # make a copy of update which has the caption as the message
+            new_update = Update(update.update_id, new_msg)
+            await handle(new_update, context, remote_data)
         else:
             logging.info("document without caption received")
             await message_user(current_chat_id, Responses.DOCUMENT_RECEIVED, context)
@@ -506,14 +519,8 @@ async def read_document(msg: Message):
     return content
 
 
-def format_document(file_name: str, content: str, caption: Optional[str]):
+def format_document(file_name: str, content: str):
     content = f"Document title: {file_name}\nDocument content: {content}"
-    if caption is not None:
-            if is_turbo(caption):
-                logging.info("turbo document")
-                content += f"\nDocument caption: {remove_turbo(caption)}"
-            else:
-                content += f"\nDocument caption: {caption}"
     return content
 
 def switch_conversation(remote_data: RemoteData):
@@ -583,6 +590,7 @@ def format_search_results(top_results: List[Tuple[str, float]]):
     return "\n".join([f"{conv_id}: {sim}" for conv_id, sim in formatted_results])
 
 def search_conversations(remote_data: RemoteData, filter: Callable[[str], bool] = lambda x: True):
+    DEFAULT_NUM_SEARCH_RESULTS = 5
     # finds the user's top n conversations with the closest embedding to the given query
     async def search_conversations_(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info(f"chat {update.effective_chat.id} is trying to search conversations: {context.args}")
@@ -593,12 +601,13 @@ def search_conversations(remote_data: RemoteData, filter: Callable[[str], bool] 
         c00 = context.args[0].split(" ")[0]
         if not c00.isdigit():
             logging.info(f"chat {update.effective_chat.id} tried to search conversations, but provided an invalid number of conversations")
-            return await message_user(update.effective_chat.id, "please specify the number of conversations to return", context)
-        requested_num_results = int(c00)
+            requested_num_results = DEFAULT_NUM_SEARCH_RESULTS
+        else:
+            requested_num_results = int(c00)
         # find the rest of the message, cutting off the command and number of results requested
         content_index = update.message.text.find(c00) + len(c00) + 1
         query = update.message.text[content_index:]
-        query_embedding = query_embeddings_model(dumps([{"role": "user", "content": query}]), model=EMBEDDINGS_MODEL)
+        query_embedding = query_embeddings_model(query, model=EMBEDDINGS_MODELS[0])
         # for each conversation, read or create the embedding and compute the similarity
         results = []
         for blob in remote_data.bucket.list_blobs(prefix=f"{update.effective_chat.id}"):
@@ -676,18 +685,35 @@ async def error_handler(update: Optional[object], context: CallbackContext):
 
 # === OpenAI stuff =====================================================================================================
 
-def query_model(previous_messages, model=MODEL):
-    response = openai.ChatCompletion.create(model=model, messages=previous_messages)
-    logging.info(f"got response: {response}")
-    return response['choices'][0]['message']['content']
+def query_model(previous_messages, model=None):
+    print("PREVIOUS MESSAGES:", previous_messages)
+    if model is None:
+        model = DEFAULT_MODELS[0]
+    if MODEL_DATA[model]["mode"] == "chat":
+        response = openai.ChatCompletion.create(model=model, messages=previous_messages)
+        logging.info(f"got ChatCompletion response: {response}")
+        return response['choices'][0]['message']['content']
+    elif MODEL_DATA[model]["mode"] == "completion":
+        response = openai.Completion.create(model=model, prompt=base_format(previous_messages))
+        logging.info(f"got Completion response: {response}")
+        out = response['choices'][0]['text']
+        if out:
+            return out
+        else:
+            raise NoResponseException()
+    else:
+        raise ValueError(f"model {model} has invalid mode {MODEL_DATA[model]['mode']}")
+    
 
-def query_embeddings_model(previous_messages, model=EMBEDDINGS_MODEL, average_ok=True):
-    print(f"previous messages: {previous_messages}")  # TODO remove
+def query_embeddings_model(previous_messages, model=None, average_ok=True):
+    if model is None:
+        model = EMBEDDINGS_MODELS[0]
     max_tokens = MODEL_DATA[model]["max_tokens"]
     stringified_messages = dumps(previous_messages)
     token_num = count_tokens(stringified_messages, model)
     if token_num <= MODEL_DATA[model]["max_tokens"]:
         texts_to_get = [(stringified_messages, token_num)]
+    # TODO: if there are ever embeddings models with longer context windows, add support for that here
     else:
         if not average_ok:
             raise TooLongEmbeddingException()
@@ -772,27 +798,47 @@ def cosine_similarity(emb1: np.ndarray, emb2: np.ndarray):
     assert len(emb1.shape) == 1
     return np.dot(emb1, emb2)/(np.linalg.norm(emb1, 2) * np.linalg.norm(emb2, 2))
 
+# format the chat messages for use in a completion or embeddings model
+def base_format(messages):
+    # remove the system prompt
+    if messages[0] == SYSTEM_PROMPT:
+        cleaned_messages = messages[1:]
+    else:
+        logging.warning(f"conversation does not start with SYSTEM_PROMPT")
+        cleaned_messages = messages
+    
+    # if there are only user messages, just use those messages as plain text
+    if all([msg["role"] == "user" for msg in cleaned_messages]):
+        return "\n".join([msg["content"] for msg in cleaned_messages])
+    
+    # otherwise, format the messages as USER: message\nASSISTANT: message\n...
+    formatted_messages = []
+    for msg in cleaned_messages:
+        formatted_messages.append(f"{msg['role'].upper()}: {msg['content']}")
+    return "\n".join(formatted_messages)
+    
 
 # === Main =============================================================================================================
 
 class Commands():
     @classmethod
-    def initialize_class(cls, BOT_CONFIG_FILE):
+    def initialize_class(cls, BOT_CONFIG_FILE, remote_data: RemoteData):
         with open(BOT_CONFIG_FILE, 'r') as config_file:
             cls.bot_config = load(config_file)
 
-        for command, value in (cls.bot_config["all_users"] | cls.bot_config["admin_only"]).items():
+        # set the names of the commands, e.g. Commands.TURBO = "turbo"
+        for command, value in (cls.bot_config["models"] | cls.bot_config["all_users"] | cls.bot_config["admin_only"]).items():
             setattr(cls, command, value["name"])
 
-    def __init__(self, BOT_CONFIG_FILE, remote_data: RemoteData):
-        # kinda ugly but allows a single source of truth shared between python and terraform
-        # TODO: dynamically generate docstrings based on description in bot_config
+        # set the command handlers
+        cls.models_command_handlers = {
+            value["name"]: model_message_gen(value["name"], [value["model"]] + value["alternates"])(remote_data)
+            for _, value in cls.bot_config["models"].items()
+        }
 
-        self.initialize_class(BOT_CONFIG_FILE)
-
-        self.all_users_command_handlers = {
+        cls.all_users_command_handlers = {
             value["name"]: globals()[value["handler"]](remote_data)
-            for command, value in self.bot_config["all_users"].items()
+            for _, value in cls.bot_config["all_users"].items()
         }
 
         # take as input a function of update and context, and return that function but with an added check if the sender is the admin
@@ -801,13 +847,23 @@ class Commands():
                 if await ensure_admin(update, context):
                     await fn(update, context)
             return add_verification_
-
-        self.admin_only_command_handlers = {
+        
+        cls.admin_only_command_handlers = {
             value["name"]: add_verification(globals()[value["handler"]](remote_data))
-            for command, value in self.bot_config["admin_only"].items()
+            for _, value in cls.bot_config["admin_only"].items()
         }
 
-        self.command_handlers = self.all_users_command_handlers | self.admin_only_command_handlers
+        cls.command_handlers = cls.models_command_handlers | cls.all_users_command_handlers | cls.admin_only_command_handlers
+
+
+    @classmethod
+    def old_initialize_class(cls, BOT_CONFIG_FILE):
+        with open(BOT_CONFIG_FILE, 'r') as config_file:
+            cls.bot_config = load(config_file)
+
+        for command, value in (cls.bot_config["models"] | cls.bot_config["all_users"] | cls.bot_config["admin_only"]).items():
+            setattr(cls, command, value["name"])
+
 
 def setup_app_polling():
     openai.api_key = getenv("OPENAI_API_KEY")
@@ -816,28 +872,69 @@ def setup_app_polling():
     BOT_CONFIG_FILE = getenv("BOT_CONFIG_FILE")
 
     remote_data = RemoteData(bucket)
-    
+
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # initialize Commands
+    Commands.initialize_class(BOT_CONFIG_FILE, remote_data)
+
+    # define defaults based on config
+    DEFAULT_MODELS.append(Commands.bot_config["default"]["model"])
+    DEFAULT_MODELS.extend(Commands.bot_config["default"]["alternates"])
+    EMBEDDINGS_MODELS.append(Commands.bot_config["embeddings_default"]["model"])
+
     # add command handlers
-    # this initializes Commands as well
-    for command, handler_fn in Commands(BOT_CONFIG_FILE, remote_data).command_handlers.items():
+    for command, handler_fn in Commands.command_handlers.items():
         application.add_handler(CommandHandler(command, handler_fn))
 
-    # create message handlers
-    regular_message_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), 
-        regular_message(remote_data))
-    document_handler = MessageHandler(filters.ATTACHMENT, handle_document(remote_data))
-    unsupported_message_handler = MessageHandler(filters.ALL, unsupported_message)
-
     # add message handlers
-    application.add_handler(regular_message_handler)
-    application.add_handler(document_handler)
-    application.add_handler(unsupported_message_handler)
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND),
+        regular_message(remote_data)))
+    application.add_handler(MessageHandler(filters.ATTACHMENT, handle_document(remote_data)))
+    application.add_handler(MessageHandler(filters.ALL, unsupported_message))
 
     application.add_error_handler(error_handler)
 
     return application
+
+def get_handler(msg: Message, remote_data: RemoteData):
+    # For documents
+    if msg.document:
+        return handle_document(remote_data)
+    elif msg.text:
+        # For commands
+        if msg.text.startswith("/"):
+            command = msg.text.split(" ", 1)[0][1:]
+            if command in Commands.command_handlers:
+                return Commands.command_handlers[command]
+            else:
+                return invalid_command
+        # For regular messages
+        else:
+            return regular_message(remote_data)
+    # Nothing else is supported
+    else:
+        return unsupported_message
+    
+async def use_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
+    try:
+        await handler(update, context=context)
+        return Responses.OKAY
+    except FakeTestErrorException as e:
+        logging.info(f"caught fake test error: {e}")
+        return Responses.TEST
+    except Exception as e:
+        context.set_error(e)
+        await error_handler(update, context=context)
+        # check if context.status is set
+        if hasattr(context, "status"):
+            return context.status, 200
+        else:
+            return Responses.NO_STATUS
+        
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE, remote_data: RemoteData):
+    handler = get_handler(update.message, remote_data)
+    return await use_handler(update, context, handler)
 
 async def webhook_(request):
     """Webhook entry point. Returns 200 even on failures, because otherwise it will retry in an undesirable way."""
@@ -853,41 +950,17 @@ async def webhook_(request):
         update = Update.de_json(request.get_json(force=True), bot)
         context = FakeContext(bot, update.message, None)
 
-        # For documents
-        if update.message.document:
-            handler = handle_document(remote_data)
-        elif update.message.text:
-            # For commands
-            if update.message.text.startswith("/"):
-                command = update.message.text.split(" ", 1)[0][1:]
-                # this initializes Commands as well
-                command_handlers_ = Commands(BOT_CONFIG_FILE, remote_data).command_handlers
-                if command in command_handlers_:
-                    handler = command_handlers_[command]
-                else:
-                    handler = invalid_command
-            # For regular messages
-            else:
-                handler = regular_message(remote_data)
-        # Nothing else is supported
-        else:
-            handler = unsupported_message
-        try:
-            await handler(update, context=context)
-            return 'okay', 200
-        except FakeTestErrorException as e:
-            logging.info(f"caught fake test error: {e}")
-            return Responses.TEST
-        except Exception as e:
-            context.set_error(e)
-            await error_handler(update, context=context)
-            # check if context.status is set
-            if hasattr(context, "status"):
-                return context.status, 200
-            else:
-                return 'no_status', 200
+        # initialize Commands
+        Commands.initialize_class(BOT_CONFIG_FILE, remote_data)
+
+        # define defaults based on config
+        DEFAULT_MODELS.append(Commands.bot_config["default"]["model"])
+        DEFAULT_MODELS.extend(Commands.bot_config["default"]["alternates"])
+        EMBEDDINGS_MODELS.append(Commands.bot_config["embeddings_default"]["model"])
+
+        return await handle(update, context, remote_data)
     else:
-        return 'error', 400
+        return Responses.ERROR
 
 def webhook(request):
     return asyncio_run(webhook_(request))

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from google.cloud import storage
-from main import FAST_MODEL, FakeTestErrorException, format_search_results, query_model, RemoteData, Responses, UserReplies, webhook, search_conversations, DATETIME_IN_FORMAT, DATETIME_CONV_FORMAT, message_user, query_embeddings_model, EMBEDDINGS_MODEL
+from main import FakeTestErrorException, format_search_results, query_model, RemoteData, Responses, UserReplies, webhook, search_conversations, DATETIME_IN_FORMAT, DATETIME_CONV_FORMAT, message_user, query_embeddings_model, logging
 from os import getenv
 import pytest
 from time import time
@@ -232,6 +232,12 @@ def setup_and_teardown(desired_datetime, no_warn_rate_limit=False):
     # delete the test conversation
     del_test_conversation()
 
+def try_ignore_stopiteration(gen):
+    try:
+        next(gen)
+    except StopIteration:
+        pass
+
 @pytest.mark.usefixtures("mock_query_model")
 def test_webhook(monkeypatch):
     """Test that the webhook returns a 200 status code. Doesn't send a real query to OpenAI, but does send a real response to the admin."""
@@ -239,14 +245,15 @@ def test_webhook(monkeypatch):
     
     s = setup_and_teardown(TEST_DATETIME, no_warn_rate_limit=True)
     next(s)
-    request = MockRequest(example_request_json("test request"))
-
-    resp = webhook(request)
-    assert resp == Responses.OKAY, "webhook request errored"
     try:
-        next(s)
-    except StopIteration:
-        pass
+        request = MockRequest(example_request_json("test request"))
+
+        resp = webhook(request)
+        assert resp == Responses.OKAY, "webhook request errored"
+    except Exception:
+        try_ignore_stopiteration(s)
+        raise
+    try_ignore_stopiteration(s)
 
 @pytest.fixture(autouse=True)
 def mock_message_user(monkeypatch):
@@ -276,7 +283,17 @@ def setup_and_teardown_default(mock_message_user):
 
 def test_query_model():
     """Run a query on gpt-3.5-turbo and make sure it returns a string."""
-    assert isinstance(query_model(example_query, FAST_MODEL), str), "query_model did not return a string"
+    assert isinstance(query_model(example_query, "gpt-3.5-turbo"), str), "query_model did not return a string"
+
+def test_query_completions_model():
+    """Run a query on davinci-002 and make sure it returns a string."""
+    assert isinstance(query_model(example_query, "davinci-002"), str), "query_model did not return a string"
+
+@pytest.mark.usefixtures("mock_query_model")
+def test_help():
+    request = MockRequest(example_request_json("/help"))
+    resp = webhook(request)
+    assert resp == Responses.OKAY, "help response errored"
 
 # mock_message_user shouldn't be used, but is here to prevent spamming in case of errors
 @pytest.mark.usefixtures("mock_query_model", "mock_unsupported_message")
@@ -312,97 +329,152 @@ def test_search(mock_message_user_gen, autofilter_search):
     c2 = setup_and_teardown(c2id)
 
     next(c1)
-    request = MockRequest(example_request_json("/no_response the HORSE is a glorious animal"))
-    resp = webhook(request)
-    assert resp == Responses.OKAY, "first conversation errored"
+    try:
+        request = MockRequest(example_request_json("/no_response the HORSE is a glorious animal"))
+        resp = webhook(request)
+        assert resp == Responses.OKAY, "first conversation errored"
 
-    next(c2)
-    request = MockRequest(example_request_json("/no_response how to ride a horse"))
-    resp = webhook(request)
-    assert resp == Responses.OKAY, "second conversation errored"
+        next(c2)
+        try:
+            request = MockRequest(example_request_json("/no_response how to ride a horse"))
+            resp = webhook(request)
+            assert resp == Responses.OKAY, "second conversation errored"
 
-    # the results should have that the first message is the first result and the second message is the second result
-    def check_if_result_is_close(msg):
-        # check whether msg has the format of format_search_results([(c1id, 0.9685448548924412), (c2id, 0.950411131658208)]),
-        # but where the values may differ slightly
-        eps = 0.001
-        refval1 = 0.99384
-        refval2 = 0.97358
-        ref_msg = format_search_results([(c1id, refval1), (c2id, refval2)])
-        # split ref_msg into where the given numbers occur
-        ref_msg_split1 = ref_msg.split(str(refval1))
-        if not len(ref_msg_split1) == 2:
-            print(f"length of ref_msg_split1 is {len(ref_msg_split1)}, not 2; not a match")
-            return False
-        ref_msg_split2 = ref_msg_split1[1].split(str(refval2))
-        if not len(ref_msg_split2) == 2:
-            print(f"length of ref_msg_split2 is {len(ref_msg_split2)}, not 2; not a match")
-            return False
-        ref_msg_split = [ref_msg_split1[0], ref_msg_split2[0], ref_msg_split2[1]]
-        # split msg into where the given numbers occur
-        msg_split1 = msg[:len(ref_msg_split[0])]
-        if not msg_split1 == ref_msg_split[0]:
-            print(f"msg_split1 is {msg_split1}, not {ref_msg_split[0]}; not a match")
-            return False
-        # the following section of msg should be a number (which may not be the same length as refval1).
-        # check that it is close to refval1
-        def get_prefix_float(s):
-            prefix = ""
-            decimalpointseen = False
-            for c in s:
-                if c == ".":
-                    if decimalpointseen:
-                        break
-                    else:
-                        decimalpointseen = True
-                        prefix += c
-                elif c.isdigit():
-                    prefix += c
-                else:
-                    break
-            return prefix
-        msgval1str = get_prefix_float(msg[len(ref_msg_split[0]):])
-        msgval1 = float(msgval1str)
-        if not abs(msgval1 - refval1) < eps:
-            print(f"msgval1 is {msgval1}, which is more than {eps} away from {refval1}; not a match")
-            return False
-        offset_after_val1 = len(ref_msg_split[0]) + len(msgval1str)
-        if not msg[offset_after_val1:offset_after_val1 + len(ref_msg_split[1])] == ref_msg_split[1]:
-            print(f"msg[offset_after_val1:offset_after_val1 + len(ref_msg_split[1])] is {msg[offset_after_val1:offset_after_val1 + len(ref_msg_split[1])]}, not {ref_msg_split[1]}; not a match")
-            return False
-        # the following section of msg should be a number (which may not be the same length as refval2).
-        # check that it is close to refval2
-        msgval2str = get_prefix_float(msg[offset_after_val1 + len(ref_msg_split[1]):])
-        msgval2 = float(msgval2str)
-        if not abs(msgval2 - refval2) < eps:
-            print(f"msgval2 is {msgval2}, which is more than {eps} away from {refval2}; not a match")
-            return False
-        offset_after_val2 = offset_after_val1 + len(ref_msg_split[1]) + len(msgval2str)
-        if not msg[offset_after_val2:] == ref_msg_split[2]:
-            print(f"msg[offset_after_val2:] is {msg[offset_after_val2:]}, not {ref_msg_split[2]}; not a match")
-            return False
-        return True
+            # the results should have that the first message is the first result and the second message is the second result
+            def check_if_result_is_close(msg):
+                # check whether msg has the format of format_search_results([(c1id, 0.9685448548924412), (c2id, 0.950411131658208)]),
+                # but where the values may differ slightly
+                eps = 0.001
+                refval1 = 0.9705
+                refval2 = 0.8625
+                ref_msg = format_search_results([(c1id, refval1), (c2id, refval2)])
+                # split ref_msg into where the given numbers occur
+                ref_msg_split1 = ref_msg.split(str(refval1))
+                if not len(ref_msg_split1) == 2:
+                    print(f"length of ref_msg_split1 is {len(ref_msg_split1)}, not 2; not a match")
+                    return False
+                ref_msg_split2 = ref_msg_split1[1].split(str(refval2))
+                if not len(ref_msg_split2) == 2:
+                    print(f"length of ref_msg_split2 is {len(ref_msg_split2)}, not 2; not a match")
+                    return False
+                ref_msg_split = [ref_msg_split1[0], ref_msg_split2[0], ref_msg_split2[1]]
+                # split msg into where the given numbers occur
+                msg_split1 = msg[:len(ref_msg_split[0])]
+                if not msg_split1 == ref_msg_split[0]:
+                    print(f"msg_split1 is {msg_split1}, not {ref_msg_split[0]}; not a match")
+                    return False
+                # the following section of msg should be a number (which may not be the same length as refval1).
+                # check that it is close to refval1
+                def get_prefix_float(s):
+                    prefix = ""
+                    decimalpointseen = False
+                    for c in s:
+                        if c == ".":
+                            if decimalpointseen:
+                                break
+                            else:
+                                decimalpointseen = True
+                                prefix += c
+                        elif c.isdigit():
+                            prefix += c
+                        else:
+                            break
+                    return prefix
+                msgval1str = get_prefix_float(msg[len(ref_msg_split[0]):])
+                msgval1 = float(msgval1str)
+                if not abs(msgval1 - refval1) < eps:
+                    print(f"msgval1 is {msgval1}, which is more than {eps} away from {refval1}; not a match")
+                    return False
+                offset_after_val1 = len(ref_msg_split[0]) + len(msgval1str)
+                if not msg[offset_after_val1:offset_after_val1 + len(ref_msg_split[1])] == ref_msg_split[1]:
+                    print(f"msg[offset_after_val1:offset_after_val1 + len(ref_msg_split[1])] is {msg[offset_after_val1:offset_after_val1 + len(ref_msg_split[1])]}, not {ref_msg_split[1]}; not a match")
+                    return False
+                # the following section of msg should be a number (which may not be the same length as refval2).
+                # check that it is close to refval2
+                msgval2str = get_prefix_float(msg[offset_after_val1 + len(ref_msg_split[1]):])
+                msgval2 = float(msgval2str)
+                if not abs(msgval2 - refval2) < eps:
+                    print(f"msgval2 is {msgval2}, which is more than {eps} away from {refval2}; not a match")
+                    return False
+                offset_after_val2 = offset_after_val1 + len(ref_msg_split[1]) + len(msgval2str)
+                if not msg[offset_after_val2:] == ref_msg_split[2]:
+                    print(f"msg[offset_after_val2:] is {msg[offset_after_val2:]}, not {ref_msg_split[2]}; not a match")
+                    return False
+                return True
         
-    mock_message_user_gen(check_if_result_is_close)
+            mock_message_user_gen(check_if_result_is_close)
 
-    # now, do the semantic search
-    request = MockRequest(example_search_request_json("the HORSE is a noble animal", 2))
-    resp = webhook(request)
-    assert resp == Responses.TEST, f"search response did not match template"
+            # now, do the semantic search
+            request = MockRequest(example_search_request_json("the HORSE is a noble animal", 2))
+            resp = webhook(request)
+            assert resp == Responses.TEST, f"search response did not match template"
 
+        except Exception:
+            try_ignore_stopiteration(c2)
+            raise
+        try_ignore_stopiteration(c2)
+    except Exception:
+        try_ignore_stopiteration(c1)
+        raise
+    try_ignore_stopiteration(c1)
+
+@pytest.mark.usefixtures("mock_query_model", "mock_message_user")
+def test_switch_to_longer_model(monkeypatch):
+    # force a fresh conversation, so that the token number counting works properly
+    c = setup_and_teardown(TEST_DATETIMES[1], no_warn_rate_limit=False)
+    next(c)
     try:
-       next(c2)
-    except StopIteration:
-        pass
-    try:
-        next(c1)
-    except StopIteration:
-        pass
+        # create a message long enough to require a longer model, and check that it does not fail.
+        # use turbo model becasuse it has a long version available
+        request1 = MockRequest(example_request_json("/turbo " + "a " * 2000))
+        resp = webhook(request1)
+        assert resp == Responses.OKAY, "webhook request errored"
+
+        # create a message long enough to not be handled, and check that it does not fail
+        request2 = MockRequest(example_request_json("/turbo " + "a " * 8000))
+        resp = webhook(request2)
+        assert resp == Responses.OKAY, "webhook request errored"
+
+        # now, check that these do use the longer model/warn about token limit as appropriate
+
+        old_info = logging.info
+        old_error = logging.error
+
+        # patch logging.info so that it raises a FakeTestErrorException when it is called with a message containing "trying longer context model"
+        def mock_info(msg):
+            if "trying longer context model" in msg:
+                print(f"mock_info called with key message {msg}")
+                raise FakeTestErrorException("long context model tried")
+            else:
+                print(f"mock_info called with {msg}")
+                old_info(msg)
+        monkeypatch.setattr("main.logging.info", mock_info)
+        resp = webhook(request1)
+        assert resp == Responses.TEST, "did not print message indicating trying longer context model"
+
+        # undo the patch
+        monkeypatch.setattr("main.logging.info", old_info)
+
+        # patch logging.error so that it raises a FakeTestErrorException when it is called with a message containing "token limit"
+        def mock_error(msg, *args, **kwargs):
+            if "token limit" in msg:
+                print(f"mock_error called with key message {msg}")
+                raise FakeTestErrorException("message too long")
+            else:
+                print(f"mock_error called with {msg}")
+                old_error(msg, *args, **kwargs)
+        monkeypatch.setattr("main.logging.error", mock_error)
+        resp = webhook(request2)
+        assert resp == Responses.TEST, "did not print message indicating message was too long"
+    except Exception:
+        try_ignore_stopiteration(c)
+        raise
+    try_ignore_stopiteration(c)
 
 @pytest.mark.usefixtures("mock_query_model")
 def test_long_message_embedding(replace_error, mock_message_user_gen, autofilter_search, monkeypatch):
     old_qem = query_embeddings_model
-    def new_qem(previous_messages, model=EMBEDDINGS_MODEL, average_ok=True):
+    def new_qem(previous_messages, model=None, average_ok=True):
         return old_qem(previous_messages, model, False)
     monkeypatch.setattr("main.query_embeddings_model", new_qem)
 
@@ -428,4 +500,3 @@ def test_ensure_admin(mock_message_user_gen):
     request = MockRequest(example_request_json("/usage_stats", from_id=ADMIN_CHAT_ID))
     resp = webhook(request)
     assert resp == Responses.OKAY, "ensure_admin did not send the expected response for admin user"
-    
