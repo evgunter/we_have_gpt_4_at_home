@@ -1,7 +1,6 @@
 import logging
 import numpy as np
-import openai
-
+from openai import OpenAI
 from asyncio import run as asyncio_run
 from datetime import datetime, timezone
 from google.cloud import storage
@@ -20,6 +19,8 @@ from typing import List, Optional, Tuple, Callable, Dict
 
 
 # === Setup ===========================================================================================================
+
+client = OpenAI(api_key=getenv("OPENAI_API_KEY"))
 
 # filled in based on commands.json
 DEFAULT_MODELS = []
@@ -698,13 +699,13 @@ def query_model(previous_messages, model=None):
     if model is None:
         model = DEFAULT_MODELS[0]
     if MODEL_DATA[model]["mode"] == "chat":
-        response = openai.ChatCompletion.create(model=model, messages=previous_messages)
+        response = client.chat.completions.create(model=model, messages=previous_messages)
         logging.info(f"got ChatCompletion response: {response}")
-        return response['choices'][0]['message']['content']
+        return response.choices[0].message.content
     elif MODEL_DATA[model]["mode"] == "completion":
-        response = openai.Completion.create(model=model, prompt=base_format(previous_messages))
+        response = client.completions.create(model=model, prompt=base_format(previous_messages))
         logging.info(f"got Completion response: {response}")
-        out = response['choices'][0]['text']
+        out = response.choices[0].text
         if out:
             return out
         else:
@@ -788,7 +789,7 @@ def query_embeddings_model(previous_messages, model=None, average_ok=True):
 
 # you can use openai.embeddings_utils.get_embeddings for this, but it pulls in a ton of dependencies
 def get_embeddings(txts, model='text-embedding-ada-002'):
-    emb = openai.Embedding.create(input=txts, model=model)['data'][0]['embedding']
+    emb = client.embeddings.create(input=txts, model=model)['data'][0]['embedding']
     # ensure the output is a list of vectors, even if txts is a singleton
     if emb:
         if isinstance(emb, list) and emb and isinstance(emb[0], list):  # result is a list of embeddings
@@ -874,7 +875,6 @@ class Commands():
 
 
 def setup_app_polling():
-    openai.api_key = getenv("OPENAI_API_KEY")
     BOT_TOKEN = getenv("BOT_TOKEN")
     bucket = getenv("BUCKET")
     BOT_CONFIG_FILE = getenv("BOT_CONFIG_FILE")
@@ -946,7 +946,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE, remote_data
 
 async def webhook_(request):
     """Webhook entry point. Returns 200 even on failures, because otherwise it will retry in an undesirable way."""
-    openai.api_key = getenv("OPENAI_API_KEY")
     BOT_TOKEN = getenv("BOT_TOKEN")
     bucket = getenv("BUCKET")
     BOT_CONFIG_FILE = getenv("BOT_CONFIG_FILE")
