@@ -3,7 +3,7 @@ channels:
   - conda-forge
 dependencies:
   - google-cloud-storage
-  - openai
+  - openai>=1.0.0
   - python-telegram-bot
   - tiktoken
   - pytest

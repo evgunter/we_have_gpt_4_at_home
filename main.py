@@ -26,6 +26,14 @@ DEFAULT_MODELS = []
 EMBEDDINGS_MODELS = []
 
 MODEL_DATA = {
+    "gpt-4-1106-preview": {
+        "max_tokens": 128000,
+        "mode": "chat",
+    },
+    "gpt-4-vision-preview": {
+        "max_tokens": 128000,
+        "mode": "chat",
+    },
     "gpt-4": {
         "max_tokens": 8192,
         "mode": "chat",
